@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "market-state-lab"
+version = "0.1.0"
+description = "Point-in-time aware US market state and style research lab"
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "numpy>=1.26,<3",
+  "pandas>=2.2,<3",
+  "pyarrow>=15",
+  "PyYAML>=6",
+  "requests>=2.32",
+  "scikit-learn>=1.5",
+  "plotly>=5.24",
+]
+
+[project.optional-dependencies]
+research = ["jupyterlab>=4.2", "ipykernel>=6.29"]
+dev = ["pytest>=8.2"]
+
+[project.scripts]
+market-state = "market_state_lab.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+  "ignore:Could not find the number of physical cores.*:UserWarning",
+]

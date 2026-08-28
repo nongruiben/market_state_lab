@@ -1,0 +1,15 @@
+.venv/
+.idea/
+.env
+__pycache__/
+.pytest_cache/
+*.py[cod]
+data/raw/*
+data/processed/*
+reports/*
+models/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!reports/.gitkeep
+!models/.gitkeep
+
