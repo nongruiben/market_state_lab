@@ -6,6 +6,7 @@ import pytest
 
 from market_state_lab.config import load_config
 from market_state_lab.data.public import PublicDataBundle
+from market_state_lab.evaluation import synthetic_regime_metrics
 from market_state_lab.features import build_features
 from market_state_lab.models import fit_market_state, fit_style
 
@@ -75,19 +76,82 @@ def test_feature_lag_and_walk_forward_models() -> None:
     config["features"]["rolling_normalization_window"] = 252
     config["models"]["market_state"]["minimum_train_observations"] = 400
     config["models"]["market_state"]["refit_every_observations"] = 126
-    features = build_features(bundle, config)
+    features = build_features(bundle, config, as_of=dates[-1])
 
-    assert np.isnan(features.source_panel.loc[dates[0], "ff_mkt_rf"])
-    assert features.source_panel.loc[dates[1], "ff_mkt_rf"] == pytest.approx(bundle.french.loc[dates[0], "mkt_rf"])
+    assert features.source_panel.loc[dates[0], "ff_mkt_rf"] == pytest.approx(
+        bundle.french.loc[dates[0], "mkt_rf"]
+    )
 
     state = fit_market_state(features.market, config)
-    probabilities = state.history[["p_calm", "p_transition", "p_stress"]].dropna()
+    probabilities = state.history[["p_low_risk", "p_mid_risk", "p_high_risk"]].dropna()
     assert not probabilities.empty
     assert np.allclose(probabilities.sum(axis=1), 1.0)
-    assert state.latest["market_state"] in {"calm", "transition", "stress"}
+    assert state.latest["market_state"] in {"low_risk", "mid_risk", "high_risk"}
     assert state.feature_columns
+    assert {"baseline", "gmm", "hmm", "ensemble"}.issubset(state.comparison["model"])
+    ensemble_rows = state.history["p_low_risk"].notna()
+    assert state.history.loc[ensemble_rows, "weight_baseline"].ge(0.4 - 1e-12).all()
+    truth = pd.Series(
+        np.repeat(["low_risk", "mid_risk", "high_risk", "mid_risk", "low_risk"], 220),
+        index=dates,
+    )
+    recovery = synthetic_regime_metrics(state.history, truth)
+    assert recovery["balanced_accuracy"] > 0.40
+    assert recovery["brier"] < 1.0
+    assert state.decision_value["observations"].nunique() == 1
 
     style = fit_style(features.style_returns, config)
     assert not style.latest.empty
-    assert style.latest["favored_probability"].between(0.5, 1.0).all()
+    assert style.latest["favored_strength"].between(0.5, 1.0).all()
+    assert not any(column.startswith("p_") for column in style.history)
+    defensive = style.latest.loc[style.latest["dimension"].eq("defensive")].iloc[0]
+    assert defensive["source_mode"] == "etf"
 
+
+def _slice_bundle(bundle: PublicDataBundle, end: pd.Timestamp) -> PublicDataBundle:
+    return PublicDataBundle(
+        macro=bundle.macro.loc[:end],
+        vix=bundle.vix.loc[:end],
+        ofr=bundle.ofr.loc[:end],
+        french=bundle.french.loc[:end],
+        etf_close=bundle.etf_close.loc[:end],
+        manifest=bundle.manifest,
+    )
+
+
+def test_full_pipeline_prefix_invariance() -> None:
+    bundle, dates = _synthetic_bundle()
+    cutoff = dates[930]
+    config = load_config()
+    config["project"]["start_date"] = str(dates[0].date())
+    config["features"]["rolling_normalization_window"] = 252
+    config["models"]["market_state"]["minimum_train_observations"] = 400
+    config["models"]["market_state"]["refit_every_observations"] = 126
+
+    full_features = build_features(bundle, config, as_of=dates[-1])
+    prefix_features = build_features(_slice_bundle(bundle, cutoff), config, as_of=cutoff)
+    pd.testing.assert_series_equal(
+        full_features.market.loc[cutoff],
+        prefix_features.market.loc[cutoff],
+        check_names=False,
+    )
+
+    full_state = fit_market_state(full_features.market, config)
+    prefix_state = fit_market_state(prefix_features.market, config)
+    columns = [
+        "p_low_risk",
+        "p_mid_risk",
+        "p_high_risk",
+        "decision_p_low_risk",
+        "decision_p_mid_risk",
+        "decision_p_high_risk",
+        "weight_baseline",
+        "weight_gmm",
+        "weight_hmm",
+    ]
+    np.testing.assert_allclose(
+        full_state.history.loc[cutoff, columns].astype(float),
+        prefix_state.history.loc[cutoff, columns].astype(float),
+        atol=1e-10,
+        rtol=1e-10,
+    )

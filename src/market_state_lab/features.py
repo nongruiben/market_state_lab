@@ -19,7 +19,7 @@ class FeatureSet:
 def _calendar(
     bundle: PublicDataBundle,
     start: pd.Timestamp,
-    maximum_lag: int,
+    as_of: pd.Timestamp,
 ) -> pd.DatetimeIndex:
     indexes = [
         frame.index
@@ -28,12 +28,8 @@ def _calendar(
     ]
     if not indexes:
         raise ValueError("No public data was downloaded")
-    last_observation = max(index.max() for index in indexes)
-    end = min(
-        last_observation + pd.offsets.BDay(maximum_lag),
-        pd.Timestamp.today().normalize(),
-    )
-    return pd.date_range(start, end, freq="B")
+    first_observation = min(index.min() for index in indexes)
+    return pd.date_range(max(start, first_observation), as_of.normalize(), freq="B")
 
 
 def _available_panel(
@@ -55,10 +51,22 @@ def _rolling_compound(returns: pd.Series, window: int) -> pd.Series:
     return np.expm1(np.log1p(safe).rolling(window, min_periods=window).sum())
 
 
-def build_features(bundle: PublicDataBundle, config: dict[str, Any]) -> FeatureSet:
+def build_features(
+    bundle: PublicDataBundle,
+    config: dict[str, Any],
+    as_of: str | pd.Timestamp | None = None,
+) -> FeatureSet:
     start = pd.Timestamp(config["project"]["start_date"])
     lags = config["data"]["publication_lags_business_days"]
-    calendar = _calendar(bundle, start, max(int(value) for value in lags.values()))
+    runtime_as_of = as_of or config.get("_runtime", {}).get("market_session")
+    end = pd.Timestamp(runtime_as_of) if runtime_as_of else pd.Timestamp.today().normalize()
+    calendar = _calendar(bundle, start, end)
+    fred_lag_daily = int(lags["fred_daily"])
+    fred_lag_weekly = int(lags["fred_weekly"])
+    if str(config["data"].get("fred", {}).get("vintage_mode", "latest")) == "point_in_time":
+        # ALFRED rows are already indexed by their first public availability date.
+        fred_lag_daily = 0
+        fred_lag_weekly = 0
 
     macro_daily_columns = [
         column
@@ -74,20 +82,22 @@ def build_features(bundle: PublicDataBundle, config: dict[str, Any]) -> FeatureS
         _available_panel(
             bundle.macro[macro_daily_columns] if macro_daily_columns else pd.DataFrame(),
             calendar,
-            int(lags["fred_daily"]),
+            fred_lag_daily,
             "macro_",
             5,
         ),
         _available_panel(
             bundle.macro[macro_weekly_columns] if macro_weekly_columns else pd.DataFrame(),
             calendar,
-            int(lags["fred_weekly"]),
+            fred_lag_weekly,
             "macro_",
             10,
         ),
         _available_panel(bundle.vix, calendar, int(lags["cboe_daily"]), "", 3),
-        _available_panel(bundle.ofr, calendar, int(lags["ofr_fsi"]), "", 5),
-        _available_panel(bundle.french, calendar, int(lags["french_daily"]), "ff_", 3),
+        # OFR/French freshness is governed by the observed last-successful date
+        # in the manifest. Their latest-vintage history is never declared causal.
+        _available_panel(bundle.ofr, calendar, 0, "", 5),
+        _available_panel(bundle.french, calendar, 0, "ff_", 3),
     ]
     etf_close = _available_panel(
         bundle.etf_close,
@@ -103,17 +113,18 @@ def build_features(bundle: PublicDataBundle, config: dict[str, Any]) -> FeatureS
         columns=lambda column: column.replace("px_", "ret_", 1)
     )
     source = pd.concat([source, etf_returns], axis=1)
-    if "ff_mkt_rf" in source and "ff_rf" in source:
-        french_market_return = source["ff_mkt_rf"] + source["ff_rf"]
-        market_return = (
-            french_market_return.combine_first(source["ret_spy"])
-            if "ret_spy" in source
-            else french_market_return
-        )
-    elif "ret_spy" in source:
+    allow_french_market = bool(
+        config["features"].get("use_revision_prone_french_history", False)
+    )
+    if "ret_spy" in source:
         market_return = source["ret_spy"]
+    elif allow_french_market and "ff_mkt_rf" in source and "ff_rf" in source:
+        french_market_return = source["ff_mkt_rf"] + source["ff_rf"]
+        market_return = french_market_return
     else:
-        raise ValueError("Neither French market return nor SPY return is available")
+        raise ValueError(
+            "SPY return is unavailable and revision-prone French market history is disabled"
+        )
 
     feature_config = config["features"]
     market = pd.DataFrame(index=calendar)
@@ -180,6 +191,6 @@ def build_features(bundle: PublicDataBundle, config: dict[str, Any]) -> FeatureS
     if reversal_columns:
         style["reversal"] = source[reversal_columns].mean(axis=1)
     if {"ret_usmv", "ret_spy"}.issubset(source.columns):
-        style["defensive"] = source["ret_usmv"] - source["ret_spy"]
+        style["defensive_etf"] = source["ret_usmv"] - source["ret_spy"]
 
     return FeatureSet(market=market, style_returns=style, source_panel=source)

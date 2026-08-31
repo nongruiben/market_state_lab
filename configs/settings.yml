@@ -1,22 +1,25 @@
 project:
   start_date: "2000-01-01"
   timezone: "Asia/Hong_Kong"
+  market_timezone: "America/New_York"
+  market_calendar: "XNYS"
+  post_close_buffer_minutes: 20
   random_seed: 42
 
 data:
+  strict_history: false
   request_timeout_seconds: 15
   request_retries: 2
   cache_max_age_hours: 24
   publication_lags_business_days:
     fred_daily: 1
     fred_weekly: 5
-    ofr_fsi: 2
-    french_daily: 1
-    cboe_daily: 1
-    price_proxy_daily: 1
+    cboe_daily: 0
+    price_proxy_daily: 0
 
   fred:
     enabled: true
+    vintage_mode: latest  # set point_in_time and FRED_API_KEY for ALFRED initial releases
     series:
       hy_oas: BAMLH0A0HYM2
       ig_oas: BAMLC0A0CM
@@ -64,8 +67,31 @@ data:
       tlt: TLT
       gld: GLD
 
-  megadb:
-    enabled: false
+  stooq:
+    enabled: false  # current CSV endpoint returns an anti-bot page; keep as an opt-in probe
+    base_url: "https://stooq.com/q/d/l/"
+
+  yahoo:
+    enabled: true
+    base_url: "https://query1.finance.yahoo.com/v8/finance/chart"
+    min_request_interval_seconds: 1.0
+    max_jitter_seconds: 0.4
+    cooldown_seconds: 120
+
+  source_health:
+    default_max_age_business_days: 10
+    rules:
+      vix: {required: true, max_age_business_days: 3}
+      spy: {required: true, max_age_business_days: 3}
+      hy_oas: {required: false, max_age_business_days: 5}
+      ig_oas: {required: false, max_age_business_days: 5}
+      financial_conditions: {required: false, max_age_business_days: 10}
+      fed_stress: {required: false, max_age_business_days: 10}
+      financial_stress_index: {required: false, max_age_business_days: 7}
+      ff5: {required: false, max_age_business_days: 80}
+      momentum: {required: false, max_age_business_days: 80}
+      short_reversal: {required: false, max_age_business_days: 80}
+      long_reversal: {required: false, max_age_business_days: 80}
 
 ibkr:
   enabled: true
@@ -84,17 +110,57 @@ features:
   momentum_windows: [21, 63, 252]
   style_windows: [21, 63, 126]
   rolling_normalization_window: 756
+  minimum_risk_blocks: 3
+  use_revision_prone_french_history: false
 
 models:
   market_state:
     n_states: 3
     n_init: 3
     minimum_train_observations: 756
-    refit_every_observations: 63
-    gmm_weight: 0.70
-    persistence_alpha: 0.35
+    maximum_train_observations: 2520
+    refit_every_observations: 126
+    covariance_type: diag
+    reg_covar: 0.0001
+    minimum_component_effective_observations: 25
+    model_weights:
+      baseline: 0.50
+      gmm: 0.20
+      hmm: 0.30
+    dynamic_weight_window: 252
+    dynamic_weight_min_observations: 126
+    baseline_weight_floor: 0.40
+    decision_half_life_days: 15
+    evaluation_target_volatility: 0.10
+    hmm:
+      enabled: true
+      transition_prior: 12.0
+      maximum_iterations: 75
   style:
     score_temperature: 1.25
+
+news:
+  enabled: false
+  fetch_on_run: true
+  sidecar_script: "../mega/News_analysis/tws_news_fetcher_significant_web_research_v2.py"
+  raw_news_json: "../mega/News_analysis/tws_significant_news_all.json"
+  raw_web_json: "../mega/News_analysis/tws_significant_news_web_research.json"
+  narrative_report: "../mega/News_analysis/tws_significant_news_analysis.md"
+  lookback_hours: 24
+  fallback_max_age_hours: 96
+  llm_enabled: true
+  llm_provider: deepseek
+  llm_model: deepseek-v4-pro
+  llm_base_url: "https://api.deepseek.com"
+  llm_temperature: 0.0
+  llm_thinking_enabled: false
+  llm_max_clusters: 10
+  llm_max_tokens: 4096
+  llm_max_attempts: 2
+  llm_retry_sleep_seconds: 2
+  cluster_similarity_threshold: 0.52
+  event_half_life_hours: 36
+  minimum_records: 3
 
 reporting:
   history_years: 5

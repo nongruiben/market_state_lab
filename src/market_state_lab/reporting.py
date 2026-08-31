@@ -48,9 +48,9 @@ def write_dashboard(
     style_history = style.history.loc[cutoff:]
 
     probability_figure = go.Figure()
-    probability_figure.add_trace(go.Scatter(x=state_history.index, y=state_history["p_calm"], name="Calm", line=dict(color="#16845b")))
-    probability_figure.add_trace(go.Scatter(x=state_history.index, y=state_history["p_transition"], name="Transition", line=dict(color="#c08a13")))
-    probability_figure.add_trace(go.Scatter(x=state_history.index, y=state_history["p_stress"], name="Stress", line=dict(color="#ba3b46")))
+    probability_figure.add_trace(go.Scatter(x=state_history.index, y=state_history["p_low_risk"], name="Low risk", line=dict(color="#16845b")))
+    probability_figure.add_trace(go.Scatter(x=state_history.index, y=state_history["p_mid_risk"], name="Mid risk", line=dict(color="#c08a13")))
+    probability_figure.add_trace(go.Scatter(x=state_history.index, y=state_history["p_high_risk"], name="High risk", line=dict(color="#ba3b46")))
     probability_figure.update_layout(title="Walk-forward market-state probabilities", yaxis=dict(range=[0, 1], tickformat=".0%"))
 
     risk_figure = go.Figure()
@@ -74,12 +74,27 @@ def write_dashboard(
     latest = state.latest
     style_table = style.latest.copy()
     if not style_table.empty:
-        style_table["favored_probability"] = style_table["favored_probability"].map(lambda value: f"{value:.1%}")
+        style_table["favored_strength"] = style_table["favored_strength"].map(lambda value: f"{value:.1%}")
         style_table["dimension"] = style_table["dimension"].str.replace("_", " ").str.title()
         style_table["favored_style"] = style_table["favored_style"].str.replace("_", " ").str.title()
     manifest_view = manifest.copy()
     if "error" in manifest_view:
         manifest_view["error"] = manifest_view["error"].fillna("").map(lambda value: str(value)[:120])
+    vintage_warning = (
+        "Latest-vintage or retrospectively revised inputs are present. Historical rows must not be treated as a strict backtest."
+        if latest.get("history_is_latest_vintage")
+        else "All enabled historical inputs passed the configured point-in-time contract."
+    )
+    news_overlay = latest.get("news_overlay", {})
+    news_features = news_overlay.get("features", {}) if isinstance(news_overlay, dict) else {}
+    news_table = pd.DataFrame(
+        [{"feature": key, "value": value} for key, value in news_features.items()]
+    )
+    news_status = (
+        str(news_overlay.get("status") or news_overlay.get("llm", {}).get("status") or "not enabled")
+        if isinstance(news_overlay, dict)
+        else "not enabled"
+    )
 
     document = f"""<!doctype html>
 <html lang="en">
@@ -114,7 +129,7 @@ section h2 {{ font-size:16px; margin:0 0 12px; letter-spacing:0; }}
 <main>
 <div class="summary">
   <div class="metric"><span>As of</span><strong>{html.escape(str(latest['as_of']))}</strong></div>
-  <div class="metric"><span>Market state</span><strong>{html.escape(str(latest['market_state']).title())}</strong></div>
+  <div class="metric"><span>Risk state</span><strong>{html.escape(str(latest['market_state']).replace('_', ' ').title())}</strong></div>
   <div class="metric"><span>State confidence</span><strong>{latest['confidence']:.1%}</strong></div>
   <div class="metric"><span>Risk percentile</span><strong>{latest['risk_percentile']:.1%}</strong></div>
 </div>
@@ -123,9 +138,12 @@ section h2 {{ font-size:16px; margin:0 0 12px; letter-spacing:0; }}
   <section>{_figure_html(risk_figure, False)}</section>
 </div>
 <section>{_figure_html(style_figure, False)}</section>
-<section><h2>Latest style evidence</h2>{_table(style_table, ['dimension','favored_style','favored_probability','score','as_of','age_business_days','data_status'])}</section>
+<section><h2>Model comparison</h2>{_table(state.comparison)}</section>
+<section><h2>Risk decision value</h2><p class="muted">Vol-only, baseline and ensemble use the same dates and one-day-lagged exposures. Figures exclude costs and are diagnostics, not a strategy backtest.</p>{_table(state.decision_value)}</section>
+<section><h2>Latest style evidence</h2>{_table(style_table, ['dimension','favored_style','favored_strength','score','ff_score','etf_score','source_mode','source_agreement','as_of','age_business_days','data_status'])}</section>
+<section><h2>News overlay</h2><p class="muted">Status: {html.escape(news_status)}. This challenger signal is not an input to the state ensemble.</p>{_table(news_table)}</section>
 <section><h2>Data quality and freshness</h2>{_table(manifest_view)}</section>
-<section class="note">Historical state probabilities use expanding training windows and periodic refits. Latest-vintage macro series are useful for the current dashboard but require ALFRED vintages before they are used in a strict causal backtest. No output in this report is an automatic trade instruction.</section>
+<section class="note">Information date: {html.escape(str(latest.get('information_date', latest['as_of'])))}. Run date: {html.escape(str(latest.get('run_date', '')))}. {html.escape(vintage_warning)} State probabilities are an expanding-window ensemble; decision weights use a separate {float(config['models']['market_state'].get('decision_half_life_days', 15)):g}-day half-life. Style values are scores and soft signs, not calibrated win probabilities. No output in this report is an automatic trade instruction.</section>
 </main>
 </body>
 </html>"""

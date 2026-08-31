@@ -1,21 +1,20 @@
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
+import logging
+import warnings
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 import pandas as pd
-
-# Some restricted Windows environments cannot query physical cores via WMIC.
-os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(os.cpu_count() or 1))
-
+from hmmlearn.hmm import GaussianHMM
+from scipy.special import logsumexp
 from sklearn.impute import SimpleImputer
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import RobustScaler
 
-
-STATE_NAMES = ("calm", "transition", "stress")
+STATE_NAMES = ("low_risk", "mid_risk", "high_risk")
+PROBABILITY_COLUMNS = [f"p_{name}" for name in STATE_NAMES]
 
 
 @dataclass
@@ -23,6 +22,9 @@ class MarketStateResult:
     history: pd.DataFrame
     latest: dict[str, Any]
     feature_columns: list[str]
+    diagnostics: pd.DataFrame = field(default_factory=pd.DataFrame)
+    comparison: pd.DataFrame = field(default_factory=pd.DataFrame)
+    decision_value: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass
@@ -42,50 +44,79 @@ def _sigmoid(value: pd.Series | np.ndarray) -> pd.Series | np.ndarray:
     return 1.0 / (1.0 + np.exp(-np.clip(value, -20, 20)))
 
 
-def _risk_score(features: pd.DataFrame, window: int) -> pd.Series:
-    candidates: list[pd.Series] = []
-    positive = [
-        "volatility_20",
-        "volatility_60",
-        "downside_volatility_60",
-        "vix_close",
-        "vix_change_21",
-        "macro_hy_oas",
-        "macro_ig_oas",
-        "macro_financial_conditions",
-        "macro_fed_stress",
-    ]
-    positive.extend(column for column in features if column.startswith("ofr_") and "fsi" in column)
-    negative = ["momentum_63", "momentum_252", "drawdown_252", "credit_risk_return_21", "proxy_breadth"]
-    for column in dict.fromkeys(positive):
+def _block_score(
+    features: pd.DataFrame,
+    positive: list[str],
+    negative: list[str],
+    window: int,
+) -> pd.Series:
+    values: list[pd.Series] = []
+    for column in positive:
         if column in features:
-            candidates.append(_trailing_z(features[column], window).rename(column))
+            values.append(_trailing_z(features[column], window))
     for column in negative:
         if column in features:
-            candidates.append((-_trailing_z(features[column], window)).rename(column))
-    if not candidates:
-        raise ValueError("No risk features are available")
-    return pd.concat(candidates, axis=1).mean(axis=1, skipna=True).rename("risk_score")
+            values.append(-_trailing_z(features[column], window))
+    if not values:
+        return pd.Series(index=features.index, dtype=float)
+    return pd.concat(values, axis=1).mean(axis=1, skipna=True)
+
+
+def _risk_blocks(features: pd.DataFrame, window: int) -> pd.DataFrame:
+    ofr = [column for column in features if column.startswith("ofr_") and "fsi" in column]
+    blocks = {
+        "risk_volatility": _block_score(
+            features,
+            ["volatility_20", "volatility_60", "downside_volatility_60", "vix_close", "vix_change_21"],
+            [],
+            window,
+        ),
+        "risk_credit": _block_score(
+            features,
+            ["macro_hy_oas", "macro_ig_oas"],
+            ["credit_risk_return_21"],
+            window,
+        ),
+        "risk_financial_conditions": _block_score(
+            features,
+            ["macro_financial_conditions", "macro_fed_stress", *ofr],
+            [],
+            window,
+        ),
+        "risk_trend_breadth": _block_score(
+            features,
+            [],
+            ["momentum_63", "momentum_252", "drawdown_252", "proxy_breadth"],
+            window,
+        ),
+        "risk_rates": _block_score(
+            features,
+            [],
+            ["macro_yield_curve_10y2y", "macro_yield_curve_10y3m"],
+            window,
+        ),
+    }
+    return pd.DataFrame(blocks, index=features.index)
 
 
 def _rolling_percentile(series: pd.Series, window: int) -> pd.Series:
-    minimum = max(252, window // 3)
+    minimum = max(126, window // 3)
 
     def last_rank(values: np.ndarray) -> float:
         valid = values[np.isfinite(values)]
-        if len(valid) == 0:
+        if len(valid) == 0 or not np.isfinite(values[-1]):
             return np.nan
-        return float((valid <= valid[-1]).mean())
+        return float((valid <= values[-1]).mean())
 
     return series.rolling(window, min_periods=minimum).apply(last_rank, raw=True)
 
 
 def _baseline_probabilities(percentile: pd.Series) -> pd.DataFrame:
-    calm = _sigmoid((0.38 - percentile) / 0.10)
-    stress = _sigmoid((percentile - 0.62) / 0.10)
-    transition = np.maximum(0.05, 1.0 - np.maximum(calm, stress))
+    low = _sigmoid((0.38 - percentile) / 0.10)
+    high = _sigmoid((percentile - 0.62) / 0.10)
+    mid = np.maximum(0.05, 1.0 - np.maximum(low, high))
     probabilities = pd.DataFrame(
-        {"p_calm": calm, "p_transition": transition, "p_stress": stress},
+        {"p_low_risk": low, "p_mid_risk": mid, "p_high_risk": high},
         index=percentile.index,
     )
     return probabilities.div(probabilities.sum(axis=1), axis=0)
@@ -117,29 +148,69 @@ def _model_columns(features: pd.DataFrame, minimum_train: int) -> list[str]:
     ]
 
 
-def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketStateResult:
-    settings = config["models"]["market_state"]
-    normalization_window = int(config["features"]["rolling_normalization_window"])
+def _soft_component_order(
+    responsibilities: np.ndarray,
+    risk: np.ndarray,
+    minimum_effective: float,
+) -> tuple[list[int] | None, np.ndarray]:
+    effective = responsibilities.sum(axis=0)
+    weighted_risk = np.full(responsibilities.shape[1], np.nan)
+    valid_risk = np.isfinite(risk)
+    for component in range(responsibilities.shape[1]):
+        weights = responsibilities[valid_risk, component]
+        denominator = weights.sum()
+        if denominator > 0:
+            weighted_risk[component] = float(np.dot(weights, risk[valid_risk]) / denominator)
+    valid = (effective >= minimum_effective) & np.isfinite(weighted_risk)
+    if valid.sum() != responsibilities.shape[1]:
+        return None, effective
+    return list(np.argsort(weighted_risk)), effective
+
+
+def _forward_filter(model: GaussianHMM, values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    log_emission = model._compute_log_likelihood(values)
+    log_transition = np.log(np.clip(model.transmat_, 1e-300, None))
+    log_filtered = np.empty_like(log_emission)
+    switch = np.full(len(values), np.nan)
+    current = np.log(np.clip(model.startprob_, 1e-300, None)) + log_emission[0]
+    current -= logsumexp(current)
+    log_filtered[0] = current
+    for index in range(1, len(values)):
+        joint = current[:, None] + log_transition + log_emission[index][None, :]
+        normalizer = logsumexp(joint)
+        switch[index] = 1.0 - float(np.exp(np.diag(joint) - normalizer).sum())
+        current = logsumexp(joint, axis=0)
+        current -= logsumexp(current)
+        log_filtered[index] = current
+    return np.exp(log_filtered), switch
+
+
+def _fit_walk_forward_models(
+    values: pd.DataFrame,
+    risk_score: pd.Series,
+    settings: dict[str, Any],
+    random_seed: int,
+) -> tuple[dict[str, pd.DataFrame], pd.Series, pd.DataFrame]:
+    outputs = {
+        "gmm": pd.DataFrame(index=values.index, columns=PROBABILITY_COLUMNS, dtype=float),
+        "hmm": pd.DataFrame(index=values.index, columns=PROBABILITY_COLUMNS, dtype=float),
+    }
+    switch_probability = pd.Series(index=values.index, dtype=float, name="switch_probability")
+    diagnostics: list[dict[str, Any]] = []
     minimum_train = int(settings["minimum_train_observations"])
+    maximum_train = int(settings.get("maximum_train_observations", 0))
     refit_every = int(settings["refit_every_observations"])
-    gmm_weight = float(settings["gmm_weight"])
-    random_seed = int(config["project"]["random_seed"])
-
-    risk_score = _risk_score(features, normalization_window)
-    risk_percentile = _rolling_percentile(risk_score, normalization_window)
-    baseline = _baseline_probabilities(risk_percentile)
-    columns = _model_columns(features, minimum_train)
-    if len(columns) < 3:
-        raise ValueError(f"Only {len(columns)} usable regime features; at least 3 are required")
-
-    values = features[columns].copy()
-    gmm_probabilities = pd.DataFrame(index=features.index, columns=[f"p_{name}" for name in STATE_NAMES], dtype=float)
-    valid_positions = np.flatnonzero(values.notna().sum(axis=1).to_numpy() >= max(2, len(columns) // 3))
+    minimum_effective = float(settings.get("minimum_component_effective_observations", 25))
+    valid_positions = np.flatnonzero(
+        values.notna().sum(axis=1).to_numpy() >= max(2, len(values.columns) // 3)
+    )
     if len(valid_positions) <= minimum_train:
         raise ValueError(f"Only {len(valid_positions)} usable observations; need more than {minimum_train}")
 
     for start_offset in range(minimum_train, len(valid_positions), refit_every):
         train_positions = valid_positions[:start_offset]
+        if maximum_train > 0:
+            train_positions = train_positions[-maximum_train:]
         test_positions = valid_positions[start_offset : start_offset + refit_every]
         if len(test_positions) == 0:
             break
@@ -149,56 +220,309 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
         scaler = RobustScaler(quantile_range=(10, 90))
         train_array = scaler.fit_transform(imputer.fit_transform(train))
         test_array = scaler.transform(imputer.transform(test))
-        model = GaussianMixture(
-            n_components=int(settings["n_states"]),
-            covariance_type="full",
-            reg_covar=1e-5,
-            n_init=int(settings.get("n_init", 3)),
-            random_state=random_seed,
-        )
-        model.fit(train_array)
-        train_labels = model.predict(train_array)
         train_risk = risk_score.iloc[train_positions].to_numpy()
-        component_risk = {
-            component: float(np.nanmean(train_risk[train_labels == component]))
-            for component in range(model.n_components)
+        common = {
+            "train_end": str(train.index[-1].date()),
+            "test_start": str(test.index[0].date()),
+            "test_end": str(test.index[-1].date()),
+            "train_rows": len(train),
+            "test_rows": len(test),
         }
-        ordered_components = sorted(component_risk, key=component_risk.get)
-        raw_probabilities = model.predict_proba(test_array)
-        ordered = np.zeros_like(raw_probabilities)
-        for state_index, component in enumerate(ordered_components):
-            ordered[:, state_index] = raw_probabilities[:, component]
-        gmm_probabilities.iloc[test_positions] = ordered
 
-    combined = baseline.copy()
-    available = gmm_probabilities.notna().all(axis=1)
-    combined.loc[available] = (
-        gmm_weight * gmm_probabilities.loc[available]
-        + (1.0 - gmm_weight) * baseline.loc[available]
+        gmm_initializer: GaussianMixture | None = None
+        try:
+            gmm = GaussianMixture(
+                n_components=int(settings["n_states"]),
+                covariance_type=str(settings.get("covariance_type", "diag")),
+                reg_covar=float(settings.get("reg_covar", 1e-4)),
+                n_init=int(settings.get("n_init", 3)),
+                random_state=random_seed,
+            )
+            gmm.fit(train_array)
+            gmm_initializer = gmm
+            order, effective = _soft_component_order(
+                gmm.predict_proba(train_array), train_risk, minimum_effective
+            )
+            if order is None:
+                raise ValueError(f"underfilled component effective counts={effective.round(1).tolist()}")
+            outputs["gmm"].iloc[test_positions] = gmm.predict_proba(test_array)[:, order]
+            diagnostics.append({**common, "model": "gmm", "status": "ok", "detail": ""})
+        except Exception as exc:
+            diagnostics.append({**common, "model": "gmm", "status": "skipped", "detail": str(exc)})
+
+        if bool(settings.get("hmm", {}).get("enabled", True)):
+            try:
+                n_states = int(settings["n_states"])
+                transition_prior = float(settings.get("hmm", {}).get("transition_prior", 12.0))
+                prior = np.ones((n_states, n_states))
+                prior[np.diag_indices(n_states)] = transition_prior
+                hmm = GaussianHMM(
+                    n_components=n_states,
+                    covariance_type=str(settings.get("covariance_type", "diag")),
+                    min_covar=float(settings.get("reg_covar", 1e-4)),
+                    n_iter=int(settings.get("hmm", {}).get("maximum_iterations", 75)),
+                    tol=1e-3,
+                    transmat_prior=prior,
+                    random_state=random_seed,
+                )
+                if gmm_initializer is not None:
+                    self_probability = 0.96
+                    hmm.init_params = ""
+                    hmm.startprob_ = np.clip(gmm_initializer.weights_, 1e-6, None)
+                    hmm.startprob_ /= hmm.startprob_.sum()
+                    hmm.transmat_ = np.full(
+                        (n_states, n_states), (1.0 - self_probability) / (n_states - 1)
+                    )
+                    np.fill_diagonal(hmm.transmat_, self_probability)
+                    hmm.means_ = gmm_initializer.means_.copy()
+                    hmm.covars_ = np.maximum(
+                        gmm_initializer.covariances_, float(settings.get("reg_covar", 1e-4))
+                    )
+                hmm_logger = logging.getLogger("hmmlearn.base")
+                previous_level = hmm_logger.level
+                try:
+                    hmm_logger.setLevel(logging.ERROR)
+                    with warnings.catch_warnings():
+                        warnings.filterwarnings("error", category=RuntimeWarning, module=r"hmmlearn\..*")
+                        hmm.fit(train_array)
+                finally:
+                    hmm_logger.setLevel(previous_level)
+                history = list(hmm.monitor_.history)
+                if len(history) >= 2 and history[-1] - history[-2] < -0.01:
+                    raise ValueError(f"HMM likelihood decreased by {history[-1] - history[-2]:.6f}")
+                if not all(
+                    np.isfinite(parameter).all()
+                    for parameter in (hmm.startprob_, hmm.transmat_, hmm.means_, hmm.covars_)
+                ):
+                    raise ValueError("HMM produced non-finite parameters")
+                filtered, switches = _forward_filter(hmm, np.vstack([train_array, test_array]))
+                order, effective = _soft_component_order(
+                    filtered[: len(train_array)], train_risk, minimum_effective
+                )
+                if order is None:
+                    raise ValueError(f"underfilled state effective counts={effective.round(1).tolist()}")
+                outputs["hmm"].iloc[test_positions] = filtered[len(train_array) :, order]
+                switch_probability.iloc[test_positions] = switches[len(train_array) :]
+                diagnostics.append({**common, "model": "hmm", "status": "ok", "detail": ""})
+            except Exception as exc:
+                diagnostics.append({**common, "model": "hmm", "status": "skipped", "detail": str(exc)})
+
+    return outputs, switch_probability, pd.DataFrame(diagnostics)
+
+
+def _observable_target(percentile: pd.Series) -> pd.DataFrame:
+    target = pd.DataFrame(np.nan, index=percentile.index, columns=PROBABILITY_COLUMNS)
+    valid = percentile.notna()
+    target.loc[valid, :] = 0.0
+    target.loc[valid & percentile.lt(0.38), "p_low_risk"] = 1.0
+    target.loc[valid & percentile.between(0.38, 0.62, inclusive="both"), "p_mid_risk"] = 1.0
+    target.loc[valid & percentile.gt(0.62), "p_high_risk"] = 1.0
+    return target
+
+
+def _dynamic_ensemble(
+    probabilities: dict[str, pd.DataFrame],
+    percentile: pd.Series,
+    settings: dict[str, Any],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    configured = {name: float(value) for name, value in settings["model_weights"].items()}
+    window = int(settings.get("dynamic_weight_window", 252))
+    minimum = int(settings.get("dynamic_weight_min_observations", 126))
+    baseline_floor = float(settings.get("baseline_weight_floor", 0.4))
+    target = _observable_target(percentile)
+    losses: dict[str, pd.Series] = {}
+    for name, frame in probabilities.items():
+        daily = ((frame - target) ** 2).sum(axis=1)
+        losses[name] = daily.shift(1).rolling(window, min_periods=minimum).mean()
+
+    weights = pd.DataFrame(0.0, index=percentile.index, columns=list(probabilities))
+    ensemble = pd.DataFrame(np.nan, index=percentile.index, columns=PROBABILITY_COLUMNS)
+    for date in percentile.index:
+        available = {name: frame.loc[date].notna().all() for name, frame in probabilities.items()}
+        raw: dict[str, float] = {}
+        for name in probabilities:
+            if not available[name]:
+                raw[name] = 0.0
+                continue
+            loss = losses[name].loc[date]
+            multiplier = np.exp(-3.0 * float(loss)) if np.isfinite(loss) else 1.0
+            raw[name] = configured.get(name, 0.0) * multiplier
+        total = sum(raw.values())
+        if total <= 0:
+            continue
+        normalized = {name: value / total for name, value in raw.items()}
+        if available.get("baseline", False) and normalized["baseline"] < baseline_floor:
+            remaining = 1.0 - baseline_floor
+            other_total = sum(value for name, value in normalized.items() if name != "baseline")
+            normalized["baseline"] = baseline_floor
+            for name in normalized:
+                if name != "baseline":
+                    normalized[name] = remaining * normalized[name] / other_total if other_total else 0.0
+        weights.loc[date] = normalized
+        combined = sum(
+            normalized[name] * probabilities[name].loc[date]
+            for name in probabilities
+            if normalized[name] > 0
+        )
+        ensemble.loc[date] = combined / combined.sum()
+    return ensemble, weights.add_prefix("weight_")
+
+
+def _model_comparison(
+    probabilities: dict[str, pd.DataFrame],
+    target: pd.DataFrame,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for name, frame in probabilities.items():
+        valid = frame.notna().all(axis=1) & target.notna().all(axis=1)
+        if not valid.any():
+            continue
+        labels = frame.loc[valid].idxmax(axis=1)
+        changes = labels.ne(labels.shift()).iloc[1:]
+        durations = labels.groupby(labels.ne(labels.shift()).cumsum()).size()
+        rows.append(
+            {
+                "model": name,
+                "observations": int(valid.sum()),
+                "observable_brier": float(((frame.loc[valid] - target.loc[valid]) ** 2).sum(axis=1).mean()),
+                "flip_rate": float(changes.mean()) if len(changes) else np.nan,
+                "mean_duration_days": float(durations.mean()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _decision_value(
+    features: pd.DataFrame,
+    probabilities: dict[str, pd.DataFrame],
+    target_volatility: float,
+) -> pd.DataFrame:
+    if "market_return" not in features or "volatility_20" not in features:
+        return pd.DataFrame()
+    vol_exposure = (target_volatility / features["volatility_20"]).clip(0.0, 1.5)
+    common = features[["market_return", "volatility_20"]].notna().all(axis=1)
+    for frame in probabilities.values():
+        common &= frame.notna().all(axis=1)
+    rows: list[dict[str, Any]] = []
+    candidates: dict[str, pd.Series] = {"vol_only": vol_exposure}
+    for name, frame in probabilities.items():
+        candidates[name] = vol_exposure * (1.0 - 0.45 * frame["p_high_risk"])
+    applied_candidates = {name: exposure.shift(1) for name, exposure in candidates.items()}
+    for applied in applied_candidates.values():
+        common &= applied.notna()
+    for name, applied in applied_candidates.items():
+        strategy_return = (applied * features["market_return"]).loc[common]
+        if len(strategy_return) < 126:
+            continue
+        wealth = (1.0 + strategy_return).cumprod()
+        drawdown = wealth / wealth.cummax() - 1.0
+        rolling_vol = strategy_return.rolling(20, min_periods=20).std() * np.sqrt(252)
+        annual_vol = float(strategy_return.std() * np.sqrt(252))
+        annual_return = float((wealth.iloc[-1] ** (252.0 / len(strategy_return))) - 1.0)
+        rows.append(
+            {
+                "method": name,
+                "observations": len(strategy_return),
+                "annualized_return": annual_return,
+                "annualized_volatility": annual_vol,
+                "volatility_target_mae": float((rolling_vol - target_volatility).abs().mean()),
+                "maximum_drawdown": float(drawdown.min()),
+                "sharpe_zero_rate": annual_return / annual_vol if annual_vol > 0 else np.nan,
+                "daily_turnover": float(applied.loc[common].diff().abs().mean()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketStateResult:
+    settings = config["models"]["market_state"]
+    normalization_window = int(config["features"]["rolling_normalization_window"])
+    minimum_train = int(settings["minimum_train_observations"])
+    random_seed = int(config["project"]["random_seed"])
+
+    blocks = _risk_blocks(features, normalization_window)
+    minimum_blocks = int(config["features"].get("minimum_risk_blocks", 3))
+    risk_score = blocks.mean(axis=1, skipna=True).where(blocks.notna().sum(axis=1) >= minimum_blocks)
+    risk_score.name = "risk_score"
+    risk_percentile = _rolling_percentile(risk_score, normalization_window)
+    baseline = _baseline_probabilities(risk_percentile)
+    columns = _model_columns(features, minimum_train)
+    if len(columns) < 3:
+        raise ValueError(f"Only {len(columns)} usable regime features; at least 3 are required")
+
+    learned, switch_probability, diagnostics = _fit_walk_forward_models(
+        features[columns].copy(), risk_score, settings, random_seed
     )
-    combined = combined.ewm(alpha=float(settings["persistence_alpha"]), adjust=False).mean()
-    combined = combined.div(combined.sum(axis=1), axis=0)
-    history = pd.concat([features, risk_score, risk_percentile.rename("risk_percentile"), combined], axis=1)
-    probability_columns = ["p_calm", "p_transition", "p_stress"]
-    complete = history[probability_columns].notna().all(axis=1)
+    probabilities = {"baseline": baseline, **learned}
+    ensemble, model_weights = _dynamic_ensemble(probabilities, risk_percentile, settings)
+    half_life = float(settings.get("decision_half_life_days", 15))
+    decision = ensemble.ewm(halflife=half_life, adjust=False).mean()
+    decision = decision.div(decision.sum(axis=1), axis=0)
+
+    history = pd.concat(
+        [
+            features,
+            blocks,
+            risk_score,
+            risk_percentile.rename("risk_percentile"),
+            baseline.add_prefix("baseline_"),
+            learned["gmm"].add_prefix("gmm_"),
+            learned["hmm"].add_prefix("hmm_"),
+            model_weights,
+            ensemble,
+            decision.add_prefix("decision_"),
+            switch_probability,
+        ],
+        axis=1,
+    )
+    complete = history[PROBABILITY_COLUMNS].notna().all(axis=1)
     history["market_state"] = pd.Series(index=history.index, dtype="object")
     history.loc[complete, "market_state"] = (
-        history.loc[complete, probability_columns]
-        .idxmax(axis=1)
-        .str.replace("p_", "", regex=False)
+        history.loc[complete, PROBABILITY_COLUMNS].idxmax(axis=1).str.replace("p_", "", regex=False)
     )
-    history["state_confidence"] = history[probability_columns].max(axis=1)
-    latest_row = history.dropna(subset=probability_columns).iloc[-1]
+    history["state_confidence"] = history[PROBABILITY_COLUMNS].max(axis=1)
+    entropy = -(history[PROBABILITY_COLUMNS] * np.log(history[PROBABILITY_COLUMNS].clip(lower=1e-12))).sum(axis=1)
+    history["state_entropy"] = entropy / np.log(len(STATE_NAMES))
+    history["state_change_score"] = 1.0 - (
+        history[PROBABILITY_COLUMNS] * history[PROBABILITY_COLUMNS].shift(1)
+    ).sum(axis=1)
+
+    valid_history = history.dropna(subset=PROBABILITY_COLUMNS)
+    if valid_history.empty:
+        raise ValueError("No walk-forward state probabilities were produced")
+    latest_row = valid_history.iloc[-1]
+    latest_date = valid_history.index[-1]
+    weight_values = {
+        name.replace("weight_", ""): float(latest_row[name])
+        for name in model_weights.columns
+        if np.isfinite(latest_row[name])
+    }
     latest = {
-        "as_of": latest_row.name.date().isoformat(),
-        "market_state": latest_row["market_state"],
+        "as_of": latest_date.date().isoformat(),
+        "market_state": str(latest_row["market_state"]),
         "confidence": float(latest_row["state_confidence"]),
         "probabilities": {name: float(latest_row[f"p_{name}"]) for name in STATE_NAMES},
+        "decision_weights": {name: float(latest_row[f"decision_p_{name}"]) for name in STATE_NAMES},
         "risk_score": float(latest_row["risk_score"]),
         "risk_percentile": float(latest_row["risk_percentile"]),
-        "method": "walk-forward GMM plus observable-risk ensemble",
+        "switch_probability": (
+            float(latest_row["switch_probability"])
+            if np.isfinite(latest_row["switch_probability"])
+            else None
+        ),
+        "state_entropy": float(latest_row["state_entropy"]),
+        "model_weights": weight_values,
+        "method": "causal baseline + diagonal GMM + forward-filtered diagonal HMM",
     }
-    return MarketStateResult(history, latest, columns)
+    target = _observable_target(risk_percentile)
+    evaluated_probabilities = {**probabilities, "ensemble": ensemble}
+    comparison = _model_comparison(evaluated_probabilities, target)
+    decision_value = _decision_value(
+        features,
+        {"baseline": baseline, "ensemble": ensemble},
+        float(settings.get("evaluation_target_volatility", 0.10)),
+    )
+    return MarketStateResult(history, latest, columns, diagnostics, comparison, decision_value)
 
 
 def _annualized_score(returns: pd.Series, window: int) -> pd.Series:
@@ -214,28 +538,17 @@ def fit_style(style_returns: pd.DataFrame, config: dict[str, Any]) -> StyleResul
     weights = np.array([0.50, 0.30, 0.20][: len(windows)], dtype=float)
     weights = weights / weights.sum()
     normalization_window = int(config["features"]["rolling_normalization_window"])
-    raw_scores = pd.DataFrame(index=style_returns.index)
+    raw = pd.DataFrame(index=style_returns.index)
     for column in style_returns:
         horizon_scores = [_annualized_score(style_returns[column], window) for window in windows]
-        raw_scores[column] = sum(weight * score for weight, score in zip(weights, horizon_scores))
+        raw[column] = sum(weight * score for weight, score in zip(weights, horizon_scores))
 
-    def evidence(base: str) -> pd.Series:
-        columns = [column for column in raw_scores if column == base or column.startswith(f"{base}_")]
-        if not columns:
-            return pd.Series(index=raw_scores.index, dtype=float)
-        normalized = pd.concat(
-            [_trailing_z(raw_scores[column], normalization_window) for column in columns], axis=1
-        )
-        return normalized.mean(axis=1, skipna=True)
-
-    scores = pd.DataFrame(index=style_returns.index)
-    for dimension in ("size", "value", "quality", "conservative_investment", "momentum", "reversal", "defensive"):
-        score = evidence(dimension)
-        if score.notna().any():
-            scores[f"score_{dimension}"] = score
-
+    dimensions = (
+        "size", "value", "quality", "conservative_investment", "momentum", "reversal", "defensive"
+    )
+    history = pd.DataFrame(index=style_returns.index)
+    latest_rows: list[dict[str, Any]] = []
     temperature = float(config["models"]["style"]["score_temperature"])
-    history = scores.copy()
     pairs = {
         "size": ("small", "large"),
         "value": ("value", "growth"),
@@ -245,23 +558,43 @@ def fit_style(style_returns: pd.DataFrame, config: dict[str, Any]) -> StyleResul
         "reversal": ("reversal", "trend_persistence"),
         "defensive": ("defensive", "cyclical"),
     }
-    latest_rows = []
-    for dimension, (positive_name, negative_name) in pairs.items():
-        score_column = f"score_{dimension}"
-        if score_column not in scores:
+    for dimension in dimensions:
+        ff_column = dimension if dimension in raw else None
+        etf_name = f"{dimension}_etf"
+        etf_column = etf_name if etf_name in raw else None
+        source_scores: list[pd.Series] = []
+        if ff_column:
+            history[f"ff_score_{dimension}"] = _trailing_z(raw[ff_column], normalization_window)
+            source_scores.append(history[f"ff_score_{dimension}"])
+        if etf_column:
+            history[f"etf_score_{dimension}"] = _trailing_z(raw[etf_column], normalization_window)
+            source_scores.append(history[f"etf_score_{dimension}"])
+        if not source_scores:
             continue
-        positive = _sigmoid(scores[score_column] / temperature)
-        history[f"p_{positive_name}"] = positive
-        history[f"p_{negative_name}"] = 1.0 - positive
-        valid = history.dropna(subset=[score_column, f"p_{positive_name}"])
+        history[f"score_{dimension}"] = pd.concat(source_scores, axis=1).mean(axis=1, skipna=True)
+        history[f"soft_sign_{dimension}"] = _sigmoid(history[f"score_{dimension}"] / temperature)
+        if len(source_scores) == 2:
+            both_available = source_scores[0].notna() & source_scores[1].notna()
+            history[f"agreement_{dimension}"] = (
+                (np.sign(source_scores[0]) == np.sign(source_scores[1]))
+                .astype(float)
+                .where(both_available)
+            )
+
+        positive_name, negative_name = pairs[dimension]
+        valid = history.dropna(subset=[f"score_{dimension}", f"soft_sign_{dimension}"])
         if valid.empty:
             continue
         row = valid.iloc[-1]
-        positive_probability = float(row[f"p_{positive_name}"])
-        favored = positive_name if positive_probability >= 0.5 else negative_name
         as_of = valid.index[-1]
-        latest_available = history.index.max()
-        age_business_days = int(np.busday_count(as_of.date(), latest_available.date()))
+        soft_sign = float(row[f"soft_sign_{dimension}"])
+        favored = positive_name if soft_sign >= 0.5 else negative_name
+        age_business_days = int(np.busday_count(as_of.date(), history.index.max().date()))
+        ff_score = row.get(f"ff_score_{dimension}", np.nan)
+        etf_score = row.get(f"etf_score_{dimension}", np.nan)
+        agreement = row.get(f"agreement_{dimension}", np.nan)
+        ff_available = bool(np.isfinite(ff_score))
+        etf_available = bool(np.isfinite(etf_score))
         latest_rows.append(
             {
                 "as_of": as_of.date().isoformat(),
@@ -269,12 +602,17 @@ def fit_style(style_returns: pd.DataFrame, config: dict[str, Any]) -> StyleResul
                 "data_status": "fresh" if age_business_days <= 5 else "stale",
                 "dimension": dimension,
                 "favored_style": favored,
-                "favored_probability": max(positive_probability, 1.0 - positive_probability),
-                "score": float(row[score_column]),
-                "positive_style": positive_name,
-                "positive_probability": positive_probability,
-                "negative_style": negative_name,
-                "negative_probability": 1.0 - positive_probability,
+                "favored_strength": max(soft_sign, 1.0 - soft_sign),
+                "soft_sign": soft_sign,
+                "score": float(row[f"score_{dimension}"]),
+                "ff_score": float(ff_score) if ff_available else np.nan,
+                "etf_score": float(etf_score) if etf_available else np.nan,
+                "source_mode": (
+                    "ff+etf"
+                    if ff_available and etf_available
+                    else ("ff" if ff_available else "etf")
+                ),
+                "source_agreement": bool(agreement) if np.isfinite(agreement) else None,
             }
         )
     return StyleResult(history=history, latest=pd.DataFrame(latest_rows))

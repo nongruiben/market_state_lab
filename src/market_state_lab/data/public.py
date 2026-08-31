@@ -7,13 +7,14 @@ import re
 import time
 import zipfile
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Any
 from urllib.parse import urlencode
 
-import numpy as np
 import pandas as pd
 
 from market_state_lab.config import project_path
+from market_state_lab.data.alfred import load_initial_release_series
 from market_state_lab.data.http import CachedHttpClient
 
 
@@ -25,6 +26,7 @@ class PublicDataBundle:
     french: pd.DataFrame = field(default_factory=pd.DataFrame)
     etf_close: pd.DataFrame = field(default_factory=pd.DataFrame)
     manifest: pd.DataFrame = field(default_factory=pd.DataFrame)
+    point_in_time_status: str = "latest_vintage"
 
 
 class PublicDataLoader:
@@ -56,6 +58,7 @@ class PublicDataLoader:
         frame: pd.DataFrame | None,
         status: str,
         error: str = "",
+        vintage_mode: str = "not_applicable",
     ) -> None:
         rows = 0 if frame is None else len(frame)
         latest = "" if frame is None or frame.empty else str(frame.index.max().date())
@@ -68,33 +71,54 @@ class PublicDataLoader:
                 "rows": rows,
                 "earliest_date": earliest,
                 "latest_date": latest,
+                "vintage_mode": vintage_mode,
                 "error": error,
             }
         )
 
     def _fred(self) -> pd.DataFrame:
         section = self.config["data"]["fred"]
+        vintage_mode = str(section.get("vintage_mode", "latest"))
         frames: list[pd.Series] = []
         for name, series_id in section.get("series", {}).items():
             # FRED's graph endpoint responds much faster without a server-side
             # start-date filter; the small full history is filtered locally.
-            url = "https://fred.stlouisfed.org/graph/fredgraph.csv?" + urlencode(
-                {"id": series_id}
-            )
             try:
-                result = self.client.get(url, f"fred_{series_id}.csv")
-                raw = pd.read_csv(io.BytesIO(result.content))
-                raw.columns = [str(column).strip() for column in raw.columns]
-                date_column = raw.columns[0]
-                value_column = raw.columns[-1]
-                series = pd.to_numeric(raw[value_column], errors="coerce")
-                series.index = pd.to_datetime(raw[date_column], errors="coerce")
-                series.name = name
-                frame = self._clean_index(series.to_frame()).loc[self.start_date :]
+                if vintage_mode == "point_in_time":
+                    frame = load_initial_release_series(
+                        self.client, str(series_id), str(name), self.start_date
+                    )
+                    provider = "ALFRED"
+                    status = "success"
+                    record_vintage = "initial_release"
+                else:
+                    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?" + urlencode(
+                        {"id": series_id}
+                    )
+                    result = self.client.get(url, f"fred_{series_id}.csv")
+                    raw = pd.read_csv(io.BytesIO(result.content))
+                    raw.columns = [str(column).strip() for column in raw.columns]
+                    date_column = raw.columns[0]
+                    value_column = raw.columns[-1]
+                    series = pd.to_numeric(raw[value_column], errors="coerce")
+                    series.index = pd.to_datetime(raw[date_column], errors="coerce")
+                    series.name = name
+                    frame = self._clean_index(series.to_frame()).loc[self.start_date :]
+                    provider = "FRED"
+                    status = result.status
+                    record_vintage = "latest_revised"
                 frames.append(frame[name])
-                self._record(name, "FRED", frame, result.status)
+                self._record(name, provider, frame, status, vintage_mode=record_vintage)
             except Exception as exc:  # One missing macro series must not stop the run.
-                self._record(name, "FRED", None, "failed", str(exc))
+                provider = "ALFRED" if vintage_mode == "point_in_time" else "FRED"
+                self._record(
+                    name,
+                    provider,
+                    None,
+                    "failed",
+                    str(exc),
+                    "initial_release" if vintage_mode == "point_in_time" else "latest_revised",
+                )
         return pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
 
     def _vix(self) -> pd.DataFrame:
@@ -178,11 +202,43 @@ class PublicDataLoader:
         combined = pd.concat(frames, axis=1)
         return combined.loc[:, ~combined.columns.duplicated()].sort_index()
 
-    def _nasdaq(self) -> pd.DataFrame:
+    def _stooq(self, symbols: dict[str, str]) -> pd.DataFrame:
+        section = self.config["data"]["stooq"]
+        frames: list[pd.Series] = []
+        end_date = pd.Timestamp.today().normalize()
+        for name, symbol in symbols.items():
+            query = urlencode(
+                {
+                    "s": f"{str(symbol).lower()}.us",
+                    "d1": self.start_date.strftime("%Y%m%d"),
+                    "d2": end_date.strftime("%Y%m%d"),
+                    "i": "d",
+                }
+            )
+            url = f"{section['base_url']}?{query}"
+            try:
+                result = self.client.get(url, f"stooq_{name}.csv")
+                raw = pd.read_csv(io.BytesIO(result.content))
+                raw.columns = [str(column).strip().lower() for column in raw.columns]
+                if "date" not in raw or "close" not in raw:
+                    raise ValueError("Stooq response has no Date/Close columns")
+                series = pd.to_numeric(raw["close"], errors="coerce")
+                series.index = pd.to_datetime(raw["date"], errors="coerce")
+                series.name = name
+                frame = self._clean_index(series.to_frame()).loc[self.start_date :]
+                if frame.empty:
+                    raise ValueError("Stooq response contains no usable rows")
+                frames.append(frame[name])
+                self._record(name, "Stooq", frame, result.status)
+            except Exception as exc:
+                self._record(name, "Stooq", None, "failed", str(exc))
+        return pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
+
+    def _nasdaq(self, symbols: dict[str, str]) -> pd.DataFrame:
         section = self.config["data"]["nasdaq"]
         frames: list[pd.Series] = []
         last_request = 0.0
-        for name, symbol in section.get("symbols", {}).items():
+        for name, symbol in symbols.items():
             elapsed = time.monotonic() - last_request
             interval = float(section.get("min_request_interval_seconds", 1.5))
             interval += random.uniform(0.0, float(section.get("max_jitter_seconds", 0.5)))
@@ -240,12 +296,96 @@ class PublicDataLoader:
                 self._record(name, "Nasdaq", None, "failed", str(exc))
         return pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
 
+    def _yahoo(self, symbols: dict[str, str]) -> pd.DataFrame:
+        section = self.config["data"]["yahoo"]
+        frames: list[pd.Series] = []
+        last_request = 0.0
+        period1 = int(self.start_date.tz_localize("UTC").timestamp())
+        period2 = int((pd.Timestamp.now(tz="UTC") + timedelta(days=1)).timestamp())
+        headers = {
+            "Accept": "application/json",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+            ),
+        }
+        for name, symbol in symbols.items():
+            elapsed = time.monotonic() - last_request
+            interval = float(section.get("min_request_interval_seconds", 1.0))
+            interval += random.uniform(0.0, float(section.get("max_jitter_seconds", 0.4)))
+            if interval > elapsed:
+                time.sleep(interval - elapsed)
+            query = urlencode(
+                {
+                    "period1": period1,
+                    "period2": period2,
+                    "interval": "1d",
+                    "events": "history",
+                }
+            )
+            url = f"{section['base_url'].rstrip('/')}/{symbol}?{query}"
+            try:
+                result = self.client.get(url, f"yahoo_{name}.json", headers=headers)
+                last_request = time.monotonic()
+                payload = json.loads(result.content)
+                chart = payload.get("chart") or {}
+                entries = chart.get("result") or []
+                if not entries:
+                    raise ValueError(f"Yahoo chart contains no result: {chart.get('error')}")
+                entry = entries[0]
+                timestamps = entry.get("timestamp") or []
+                indicators = entry.get("indicators") or {}
+                adjusted = indicators.get("adjclose") or []
+                adjusted_values = adjusted[0].get("adjclose", []) if adjusted else []
+                quote = indicators.get("quote") or []
+                close_values = quote[0].get("close", []) if quote else []
+                values = adjusted_values if len(adjusted_values) == len(timestamps) else close_values
+                if not timestamps or len(values) != len(timestamps):
+                    raise ValueError("Yahoo chart timestamps and closes are inconsistent")
+                series = pd.Series(
+                    pd.to_numeric(values, errors="coerce"),
+                    index=pd.to_datetime(timestamps, unit="s", utc=True).tz_localize(None),
+                    name=name,
+                )
+                frame = self._clean_index(series.to_frame()).loc[self.start_date :]
+                if frame.empty:
+                    raise ValueError("Yahoo chart contains no usable rows")
+                frames.append(frame[name])
+                self._record(name, "Yahoo Finance Chart", frame, result.status)
+            except Exception as exc:
+                if "429" in str(exc):
+                    time.sleep(float(section.get("cooldown_seconds", 120)))
+                self._record(name, "Yahoo Finance Chart", None, "failed", str(exc))
+        return pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
+
     def load(self) -> PublicDataBundle:
         data = self.config["data"]
         macro = self._fred() if data.get("fred", {}).get("enabled", True) else pd.DataFrame()
         vix = self._vix() if data.get("cboe", {}).get("enabled", True) else pd.DataFrame()
         ofr = self._ofr() if data.get("ofr", {}).get("enabled", True) else pd.DataFrame()
         french = self._french() if data.get("french", {}).get("enabled", True) else pd.DataFrame()
-        etf_close = self._nasdaq() if data.get("nasdaq", {}).get("enabled", True) else pd.DataFrame()
+        symbols = data.get("nasdaq", {}).get("symbols", {})
+        etf_close = (
+            self._stooq(symbols)
+            if data.get("stooq", {}).get("enabled", True)
+            else pd.DataFrame()
+        )
+        missing = {name: symbol for name, symbol in symbols.items() if name not in etf_close}
+        if missing and data.get("yahoo", {}).get("enabled", True):
+            fallback = self._yahoo(missing)
+            etf_close = etf_close.combine_first(fallback)
+            missing = {name: symbol for name, symbol in symbols.items() if name not in etf_close}
+        if missing and data.get("nasdaq", {}).get("enabled", True):
+            fallback = self._nasdaq(missing)
+            etf_close = etf_close.combine_first(fallback)
         manifest = pd.DataFrame(self._manifest)
-        return PublicDataBundle(macro, vix, ofr, french, etf_close, manifest)
+        macro_point_in_time = str(data.get("fred", {}).get("vintage_mode", "latest")) == "point_in_time"
+        if macro_point_in_time and french.empty:
+            point_in_time_status = "point_in_time"
+        elif macro_point_in_time:
+            point_in_time_status = "point_in_time_macro_latest_vintage_french"
+        else:
+            point_in_time_status = "latest_vintage_macro_and_french"
+        return PublicDataBundle(
+            macro, vix, ofr, french, etf_close, manifest, point_in_time_status
+        )
