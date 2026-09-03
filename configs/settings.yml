@@ -206,6 +206,10 @@ models:
       # Left off because it costs regime recall and buys nothing on the headline
       # metric. The degeneracy it would fix is now reported instead: see the
       # degenerate / saturated_share columns in model_refit_diagnostics.csv.
+      #
+      # Note the models themselves are worth keeping even though each one loses
+      # to climatology alone: zeroing their weights costs +0.0175 forward Brier,
+      # bootstrap CI [+0.0090, +0.0266], which is 27% of the skill margin.
       method: none
       n_components: 2
       whiten: true
