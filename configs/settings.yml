@@ -20,6 +20,14 @@ data:
   fred:
     enabled: true
     vintage_mode: latest  # set point_in_time and FRED_API_KEY for ALFRED initial releases
+    # The public graph CSV endpoint serves only a rolling ~3-year window for the
+    # licensed ICE BofA spread series (hy_oas, ig_oas) while returning full history
+    # for the others, and no cosd/coed combination lifts it. With a free
+    # FRED_API_KEY the official observations endpoint returns the whole series.
+    # Without one, those two sources now fail their coverage rule loudly instead of
+    # silently dropping out of the model.
+    prefer_api: true
+    api_base_url: "https://api.stlouisfed.org/fred/series/observations"
     series:
       hy_oas: BAMLH0A0HYM2
       ig_oas: BAMLC0A0CM
@@ -79,19 +87,28 @@ data:
     cooldown_seconds: 120
 
   source_health:
+    # Freshness alone cannot see a truncated history. min_history_years and
+    # min_observation_density exist so a source that arrives on time but carries
+    # only a rolling window fails loudly instead of silently leaving the model.
+    # Density is rows / business days spanned, so leave it at 0 for weekly series.
     default_max_age_business_days: 10
+    default_min_history_years: 0
+    default_min_rows: 1
+    default_min_observation_density: 0
     rules:
-      vix: {required: true, max_age_business_days: 3}
-      spy: {required: true, max_age_business_days: 3}
-      hy_oas: {required: false, max_age_business_days: 5}
-      ig_oas: {required: false, max_age_business_days: 5}
-      financial_conditions: {required: false, max_age_business_days: 10}
-      fed_stress: {required: false, max_age_business_days: 10}
-      financial_stress_index: {required: false, max_age_business_days: 7}
-      ff5: {required: false, max_age_business_days: 80}
-      momentum: {required: false, max_age_business_days: 80}
-      short_reversal: {required: false, max_age_business_days: 80}
-      long_reversal: {required: false, max_age_business_days: 80}
+      vix: {required: true, max_age_business_days: 3, min_history_years: 15, min_observation_density: 0.9}
+      spy: {required: true, max_age_business_days: 3, min_history_years: 15, min_observation_density: 0.9}
+      hy_oas: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
+      ig_oas: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
+      yield_curve_10y2y: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
+      yield_curve_10y3m: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
+      financial_conditions: {required: false, max_age_business_days: 10, min_history_years: 15}
+      fed_stress: {required: false, max_age_business_days: 10, min_history_years: 15}
+      financial_stress_index: {required: false, max_age_business_days: 7, min_history_years: 15}
+      ff5: {required: false, max_age_business_days: 80, min_history_years: 15}
+      momentum: {required: false, max_age_business_days: 80, min_history_years: 15}
+      short_reversal: {required: false, max_age_business_days: 80, min_history_years: 15}
+      long_reversal: {required: false, max_age_business_days: 80, min_history_years: 15}
 
 ibkr:
   enabled: true
@@ -110,8 +127,40 @@ features:
   momentum_windows: [21, 63, 252]
   style_windows: [21, 63, 126]
   rolling_normalization_window: 756
-  minimum_risk_blocks: 3
+  # risk_score is the mean of exactly these blocks, always. Averaging "whatever is
+  # available" made it a 4-block quantity before HYG history starts and a 5-block
+  # quantity after, which the rolling percentile then ranked against each other.
+  # risk_credit stays out until an ICE-licensed FRED history is reachable; see
+  # data.fred.prefer_api. Promote it here once hy_oas passes its coverage rule.
+  required_risk_blocks:
+    - risk_volatility
+    - risk_financial_conditions
+    - risk_trend_breadth
+    - risk_rates
   use_revision_prone_french_history: false
+  coverage:
+    # Written to reports/feature_coverage.csv every run. `required: true` fails the
+    # run outright; `required: false` still reports below_threshold so a silently
+    # missing input is visible instead of just quietly leaving the model.
+    # Thresholds are set to pass on both the 26-year live panel and the shorter
+    # offline fixture, whose long-window features are structurally thinner.
+    default_min_coverage: 0.0
+    rules:
+      market_return: {required: true, min_coverage: 0.95}
+      volatility_20: {required: true, min_coverage: 0.95}
+      volatility_60: {required: true, min_coverage: 0.90}
+      downside_volatility_60: {required: true, min_coverage: 0.90}
+      momentum_63: {required: true, min_coverage: 0.90}
+      momentum_252: {required: true, min_coverage: 0.80}
+      drawdown_252: {required: true, min_coverage: 0.90}
+      proxy_breadth: {required: true, min_coverage: 0.95}
+      vix_close: {required: true, min_coverage: 0.95}
+      macro_yield_curve_10y2y: {required: true, min_coverage: 0.95}
+      macro_financial_conditions: {required: true, min_coverage: 0.95}
+      # Reported, not enforced: the keyless FRED path cannot deliver these.
+      macro_hy_oas: {required: false, min_coverage: 0.90}
+      macro_ig_oas: {required: false, min_coverage: 0.90}
+      credit_risk_return_21: {required: false, min_coverage: 0.60}
 
 models:
   market_state:
@@ -132,6 +181,22 @@ models:
     baseline_weight_floor: 0.40
     decision_half_life_days: 15
     evaluation_target_volatility: 0.10
+    evaluation:
+      # External scoring target. The outcome is future by construction and is used
+      # for scoring only; the tercile thresholds use only settled outcomes.
+      forward_horizon_days: 20
+      forward_window: 756
+      forward_min_observations: 252
+    calibration:
+      # The raw states beat climatology on hit rate but lose on Brier, i.e. they
+      # are informative and overconfident. One temperature per refit is the least
+      # overfit-prone fix for that, and it cannot reorder the states.
+      enabled: true
+      method: temperature
+      window: 1260
+      min_observations: 252
+      refit_every_observations: 126
+      apply_to_decision: true
     hmm:
       enabled: true
       transition_prior: 12.0

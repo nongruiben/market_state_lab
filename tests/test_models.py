@@ -142,6 +142,12 @@ def test_full_pipeline_prefix_invariance() -> None:
         "p_low_risk",
         "p_mid_risk",
         "p_high_risk",
+        # The calibrated layer is fitted against a forward target, so it is the
+        # most likely place for a lookahead to creep back in. Pin it here.
+        "calibrated_p_low_risk",
+        "calibrated_p_mid_risk",
+        "calibrated_p_high_risk",
+        "calibration_temperature",
         "decision_p_low_risk",
         "decision_p_mid_risk",
         "decision_p_high_risk",
@@ -155,3 +161,68 @@ def test_full_pipeline_prefix_invariance() -> None:
         atol=1e-10,
         rtol=1e-10,
     )
+
+
+def _configured_state():
+    bundle, dates = _synthetic_bundle()
+    config = load_config()
+    config["project"]["start_date"] = str(dates[0].date())
+    config["features"]["rolling_normalization_window"] = 252
+    config["models"]["market_state"]["minimum_train_observations"] = 400
+    config["models"]["market_state"]["refit_every_observations"] = 126
+    features = build_features(bundle, config, as_of=dates[-1])
+    return fit_market_state(features.market, config), config
+
+
+def test_comparison_reports_both_metrics_against_a_no_skill_row() -> None:
+    state, _ = _configured_state()
+    comparison = state.comparison
+    required = {
+        "self_consistency_brier",
+        "forward_brier",
+        "forward_hit_rate",
+        "paired_forward_brier",
+        "paired_climatology_brier",
+        "forward_brier_vs_climatology",
+        "beats_climatology",
+    }
+    assert required.issubset(comparison.columns)
+    # The no-skill reference must always be on the table; without it a Brier
+    # number cannot be read as skill at all.
+    assert "climatology" in set(comparison["model"])
+    assert "ensemble_calibrated" in set(comparison["model"])
+    assert not comparison.loc[comparison["model"].eq("climatology"), "beats_climatology"].any()
+    # Every skill delta must be measured on days both forecasts covered.
+    scored = comparison.loc[comparison["paired_observations"].gt(0)]
+    assert not scored.empty
+    assert scored["paired_climatology_brier"].notna().all()
+    assert "observable_brier" not in comparison.columns
+
+
+def test_risk_score_keeps_one_fixed_block_composition() -> None:
+    state, config = _configured_state()
+    required_blocks = config["features"]["required_risk_blocks"]
+    history = state.history
+    scored = history["risk_score"].notna()
+    assert scored.any()
+    # A percentile only means something if every value it ranks was built the
+    # same way, so the score must exist only when all required blocks exist.
+    assert (history.loc[scored, "risk_score_block_count"] == len(required_blocks)).all()
+    assert (history.loc[~scored, "risk_score_block_count"] < len(required_blocks)).all()
+    assert state.latest["risk_score_block_count"] == len(required_blocks)
+
+
+def test_calibration_softens_without_reordering_states() -> None:
+    state, _ = _configured_state()
+    history = state.history
+    raw = history[["p_low_risk", "p_mid_risk", "p_high_risk"]]
+    calibrated = history[["calibrated_p_low_risk", "calibrated_p_mid_risk", "calibrated_p_high_risk"]]
+    both = raw.notna().all(axis=1) & calibrated.notna().all(axis=1)
+    assert both.any()
+    assert np.allclose(calibrated.loc[both].sum(axis=1), 1.0)
+    assert history.loc[both, "calibration_temperature"].gt(0).all()
+    # Temperature scaling is monotone, so it may change confidence but must never
+    # change which state is on top. If that breaks, it is no longer calibration.
+    raw_labels = raw.loc[both].to_numpy().argmax(axis=1)
+    calibrated_labels = calibrated.loc[both].to_numpy().argmax(axis=1)
+    np.testing.assert_array_equal(raw_labels, calibrated_labels)

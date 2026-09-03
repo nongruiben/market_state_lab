@@ -135,9 +135,13 @@ def build_features(
         market[f"momentum_{window}"] = _rolling_compound(market_return, int(window))
     wealth = (1.0 + market_return.fillna(0)).cumprod()
     market["drawdown_252"] = wealth / wealth.rolling(252, min_periods=60).max() - 1.0
+    # Semi-deviation about zero. The earlier form masked positive days to NaN and
+    # then demanded 30 surviving observations, so the feature only existed in the
+    # ~19% of windows that happened to hold enough down days; it silently vanished
+    # from the volatility risk block everywhere else.
+    downside = market_return.clip(upper=0.0)
     market["downside_volatility_60"] = (
-        market_return.where(market_return < 0).rolling(60, min_periods=30).std()
-        * np.sqrt(252)
+        downside.pow(2).rolling(60, min_periods=30).mean().pow(0.5) * np.sqrt(252)
     )
     market["return_skew_60"] = market_return.rolling(60, min_periods=30).skew()
 

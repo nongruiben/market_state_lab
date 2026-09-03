@@ -311,6 +311,14 @@ def _fit_walk_forward_models(
 
 
 def _observable_target(percentile: pd.Series) -> pd.DataFrame:
+    """Self-consistency target.
+
+    This is a deterministic re-encoding of ``risk_percentile`` at the same 0.38 /
+    0.62 knots the baseline sigmoid uses, so scoring the baseline against it is an
+    identity, not evidence. It is kept because the dynamic ensemble weights are
+    defined on it, but it must never be reported as accuracy - use
+    ``_forward_volatility_target`` for that.
+    """
     target = pd.DataFrame(np.nan, index=percentile.index, columns=PROBABILITY_COLUMNS)
     valid = percentile.notna()
     target.loc[valid, :] = 0.0
@@ -318,6 +326,120 @@ def _observable_target(percentile: pd.Series) -> pd.DataFrame:
     target.loc[valid & percentile.between(0.38, 0.62, inclusive="both"), "p_mid_risk"] = 1.0
     target.loc[valid & percentile.gt(0.62), "p_high_risk"] = 1.0
     return target
+
+
+def _forward_volatility_target(
+    market_return: pd.Series,
+    horizon: int,
+    window: int,
+    minimum: int,
+) -> pd.DataFrame:
+    """External scoring target: the tercile of realised volatility over the NEXT
+    ``horizon`` sessions.
+
+    The outcome is future by construction - that is the point, and it is used for
+    scoring only, never as a model input. The tercile thresholds, however, are
+    built solely from outcomes that had already fully realised by ``t``, so the
+    labelling itself carries no lookahead.
+    """
+    forward = (
+        market_return.shift(-1).rolling(horizon, min_periods=horizon).std().shift(-(horizon - 1))
+        * np.sqrt(252)
+    )
+    settled = forward.shift(horizon)
+    low = settled.rolling(window, min_periods=minimum).quantile(1.0 / 3.0)
+    high = settled.rolling(window, min_periods=minimum).quantile(2.0 / 3.0)
+    target = pd.DataFrame(np.nan, index=market_return.index, columns=PROBABILITY_COLUMNS)
+    valid = forward.notna() & low.notna() & high.notna()
+    target.loc[valid, :] = 0.0
+    target.loc[valid & forward.le(low), "p_low_risk"] = 1.0
+    target.loc[valid & forward.gt(low) & forward.le(high), "p_mid_risk"] = 1.0
+    target.loc[valid & forward.gt(high), "p_high_risk"] = 1.0
+    return target
+
+
+def _climatology(target: pd.DataFrame, horizon: int, window: int, minimum: int) -> pd.DataFrame:
+    """No-skill reference forecast: the trailing base rate of the target.
+
+    Only outcomes settled by ``t`` contribute, so this is a forecast a person could
+    actually have made. Any model that cannot beat it has no demonstrated skill.
+    """
+    settled = target.shift(horizon)
+    rate = settled.rolling(window, min_periods=minimum).mean()
+    total = rate.sum(axis=1).replace(0.0, np.nan)
+    return rate.div(total, axis=0)
+
+
+def _apply_temperature(log_probabilities: np.ndarray, temperature: np.ndarray) -> np.ndarray:
+    scaled = log_probabilities / temperature[:, None]
+    scaled = scaled - scaled.max(axis=1, keepdims=True)
+    exponentiated = np.exp(scaled)
+    return exponentiated / exponentiated.sum(axis=1, keepdims=True)
+
+
+def _best_temperature(
+    log_probabilities: np.ndarray,
+    target: np.ndarray,
+    grid: np.ndarray,
+) -> float:
+    best_temperature = 1.0
+    best_loss = np.inf
+    for candidate in grid:
+        probabilities = _apply_temperature(
+            log_probabilities, np.full(len(log_probabilities), float(candidate))
+        )
+        loss = float(((probabilities - target) ** 2).sum(axis=1).mean())
+        if loss < best_loss:
+            best_loss = loss
+            best_temperature = float(candidate)
+    return best_temperature
+
+
+def _walk_forward_temperature(
+    probabilities: pd.DataFrame,
+    target: pd.DataFrame,
+    horizon: int,
+    settings: dict[str, Any],
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Temperature scaling refit walk-forward against the external target.
+
+    The diagnosis is overconfidence, not misinformation: the raw states beat the
+    climatology hit rate while losing to it on Brier. One scalar per refit is the
+    least overfit-prone correction for exactly that, and it cannot reorder the
+    states - only soften or sharpen them.
+    """
+    window = int(settings.get("window", 1260))
+    minimum = int(settings.get("min_observations", 252))
+    refit_every = int(settings.get("refit_every_observations", 126))
+    grid = np.geomspace(0.5, 12.0, 28)
+
+    values = probabilities.to_numpy(dtype=float)
+    outcomes = target.to_numpy(dtype=float)
+    usable = np.isfinite(values).all(axis=1) & np.isfinite(outcomes).all(axis=1)
+    log_probabilities = np.full_like(values, np.nan)
+    finite = np.isfinite(values).all(axis=1)
+    log_probabilities[finite] = np.log(np.clip(values[finite], 1e-12, None))
+
+    total = len(probabilities)
+    temperature = np.ones(total)
+    current = 1.0
+    for start in range(0, total, refit_every):
+        # A target dated d is only settled at d + horizon, so nothing inside the
+        # trailing horizon may inform the temperature used from `start` onward.
+        cutoff = start - horizon
+        if cutoff > 0:
+            lower = max(0, cutoff - window)
+            rows = np.flatnonzero(usable[lower:cutoff]) + lower
+            if len(rows) >= minimum:
+                current = _best_temperature(log_probabilities[rows], outcomes[rows], grid)
+        temperature[start : start + refit_every] = current
+
+    calibrated = pd.DataFrame(np.nan, index=probabilities.index, columns=PROBABILITY_COLUMNS)
+    if finite.any():
+        calibrated.loc[finite, :] = _apply_temperature(
+            log_probabilities[finite], temperature[finite]
+        )
+    return calibrated, pd.Series(temperature, index=probabilities.index, name="calibration_temperature")
 
 
 def _dynamic_ensemble(
@@ -368,28 +490,94 @@ def _dynamic_ensemble(
     return ensemble, weights.add_prefix("weight_")
 
 
+def _score_against(frame: pd.DataFrame, target: pd.DataFrame) -> tuple[float, float, int]:
+    valid = frame.notna().all(axis=1) & target.notna().all(axis=1)
+    if not valid.any():
+        return np.nan, np.nan, 0
+    brier = float(((frame.loc[valid] - target.loc[valid]) ** 2).sum(axis=1).mean())
+    hit = float((frame.loc[valid].idxmax(axis=1) == target.loc[valid].idxmax(axis=1)).mean())
+    return brier, hit, int(valid.sum())
+
+
 def _model_comparison(
     probabilities: dict[str, pd.DataFrame],
-    target: pd.DataFrame,
+    self_target: pd.DataFrame,
+    forward_target: pd.DataFrame,
+    climatology: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
+    """Report both metrics side by side, with the no-skill row always present.
+
+    ``self_consistency_brier`` says whether a model reproduces the hand-written
+    percentile rule; ``forward_brier`` says whether it forecasts anything. They are
+    not interchangeable and the first one is roughly six times more flattering, so
+    neither is ever published alone.
+    """
+    scored = dict(probabilities)
+    if climatology is not None:
+        scored["climatology"] = climatology
     rows: list[dict[str, Any]] = []
-    for name, frame in probabilities.items():
-        valid = frame.notna().all(axis=1) & target.notna().all(axis=1)
-        if not valid.any():
+    for name, frame in scored.items():
+        valid = frame.notna().all(axis=1) & self_target.notna().all(axis=1)
+        self_brier, _, self_observations = _score_against(frame, self_target)
+        forward_brier, forward_hit, forward_observations = _score_against(frame, forward_target)
+        if self_observations == 0 and forward_observations == 0:
             continue
-        labels = frame.loc[valid].idxmax(axis=1)
-        changes = labels.ne(labels.shift()).iloc[1:]
-        durations = labels.groupby(labels.ne(labels.shift()).cumsum()).size()
+        # The learned models only start after minimum_train, so each model covers a
+        # different span. Comparing raw Brier across those spans would compare
+        # different markets, not different models: the skill delta is therefore
+        # always measured on the days where this model and climatology both spoke.
+        paired_brier = np.nan
+        paired_reference = np.nan
+        paired_observations = 0
+        if climatology is not None:
+            paired = (
+                frame.notna().all(axis=1)
+                & climatology.notna().all(axis=1)
+                & forward_target.notna().all(axis=1)
+            )
+            if paired.any():
+                paired_observations = int(paired.sum())
+                paired_brier = float(
+                    ((frame.loc[paired] - forward_target.loc[paired]) ** 2).sum(axis=1).mean()
+                )
+                paired_reference = float(
+                    ((climatology.loc[paired] - forward_target.loc[paired]) ** 2)
+                    .sum(axis=1)
+                    .mean()
+                )
+        labelled = frame.dropna(how="any")
+        if labelled.empty:
+            flip_rate = np.nan
+            mean_duration = np.nan
+        else:
+            labels = labelled.idxmax(axis=1)
+            changes = labels.ne(labels.shift()).iloc[1:]
+            durations = labels.groupby(labels.ne(labels.shift()).cumsum()).size()
+            flip_rate = float(changes.mean()) if len(changes) else np.nan
+            mean_duration = float(durations.mean())
         rows.append(
             {
                 "model": name,
                 "observations": int(valid.sum()),
-                "observable_brier": float(((frame.loc[valid] - target.loc[valid]) ** 2).sum(axis=1).mean()),
-                "flip_rate": float(changes.mean()) if len(changes) else np.nan,
-                "mean_duration_days": float(durations.mean()),
+                "self_consistency_brier": self_brier,
+                "forward_brier": forward_brier,
+                "forward_hit_rate": forward_hit,
+                "forward_observations": forward_observations,
+                "paired_observations": paired_observations,
+                "paired_forward_brier": paired_brier,
+                "paired_climatology_brier": paired_reference,
+                "forward_brier_vs_climatology": paired_brier - paired_reference,
+                "beats_climatology": bool(paired_brier < paired_reference)
+                if np.isfinite(paired_brier) and np.isfinite(paired_reference)
+                else False,
+                "flip_rate": flip_rate,
+                "mean_duration_days": mean_duration,
             }
         )
-    return pd.DataFrame(rows)
+    comparison = pd.DataFrame(rows)
+    if not comparison.empty and "model" in comparison:
+        comparison.loc[comparison["model"].eq("climatology"), "beats_climatology"] = False
+    return comparison
 
 
 def _decision_value(
@@ -441,9 +629,21 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
     random_seed = int(config["project"]["random_seed"])
 
     blocks = _risk_blocks(features, normalization_window)
-    minimum_blocks = int(config["features"].get("minimum_risk_blocks", 3))
-    risk_score = blocks.mean(axis=1, skipna=True).where(blocks.notna().sum(axis=1) >= minimum_blocks)
+    # A mean over "whatever blocks happen to exist today" is not one quantity: it
+    # was a 4-block mean before HYG history begins and a 5-block mean after, and
+    # _rolling_percentile then ranked today's value against a window built from the
+    # other composition. Fix the composition instead, and let a missing required
+    # block produce NaN rather than a quietly different score.
+    configured_blocks = config["features"].get("required_risk_blocks") or list(blocks.columns)
+    required_blocks = [str(name) for name in configured_blocks]
+    unknown = [name for name in required_blocks if name not in blocks.columns]
+    if unknown:
+        raise ValueError(f"Unknown required risk blocks: {unknown}")
+    required_present = blocks[required_blocks].notna()
+    risk_score = blocks[required_blocks].mean(axis=1).where(required_present.all(axis=1))
     risk_score.name = "risk_score"
+    risk_score_block_count = required_present.sum(axis=1).rename("risk_score_block_count")
+    risk_blocks_available = blocks.notna().sum(axis=1).rename("risk_blocks_available")
     risk_percentile = _rolling_percentile(risk_score, normalization_window)
     baseline = _baseline_probabilities(risk_percentile)
     columns = _model_columns(features, minimum_train)
@@ -455,8 +655,31 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
     )
     probabilities = {"baseline": baseline, **learned}
     ensemble, model_weights = _dynamic_ensemble(probabilities, risk_percentile, settings)
+
+    evaluation = settings.get("evaluation", {}) or {}
+    forward_horizon = int(evaluation.get("forward_horizon_days", 20))
+    forward_window = int(evaluation.get("forward_window", 756))
+    forward_minimum = int(evaluation.get("forward_min_observations", 252))
+    forward_target = _forward_volatility_target(
+        features["market_return"], forward_horizon, forward_window, forward_minimum
+    )
+    climatology = _climatology(forward_target, forward_horizon, forward_window, forward_minimum)
+
+    calibration = settings.get("calibration", {}) or {}
+    if bool(calibration.get("enabled", True)):
+        calibrated, temperature = _walk_forward_temperature(
+            ensemble, forward_target, forward_horizon, calibration
+        )
+    else:
+        calibrated = ensemble.copy()
+        temperature = pd.Series(
+            1.0, index=ensemble.index, name="calibration_temperature", dtype=float
+        )
+    apply_to_decision = bool(calibration.get("apply_to_decision", True))
+
     half_life = float(settings.get("decision_half_life_days", 15))
-    decision = ensemble.ewm(halflife=half_life, adjust=False).mean()
+    decision_source = calibrated if apply_to_decision else ensemble
+    decision = decision_source.ewm(halflife=half_life, adjust=False).mean()
     decision = decision.div(decision.sum(axis=1), axis=0)
 
     history = pd.concat(
@@ -464,12 +687,16 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
             features,
             blocks,
             risk_score,
+            risk_score_block_count,
+            risk_blocks_available,
             risk_percentile.rename("risk_percentile"),
             baseline.add_prefix("baseline_"),
             learned["gmm"].add_prefix("gmm_"),
             learned["hmm"].add_prefix("hmm_"),
             model_weights,
             ensemble,
+            calibrated.add_prefix("calibrated_"),
+            temperature,
             decision.add_prefix("decision_"),
             switch_probability,
         ],
@@ -502,8 +729,16 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
         "market_state": str(latest_row["market_state"]),
         "confidence": float(latest_row["state_confidence"]),
         "probabilities": {name: float(latest_row[f"p_{name}"]) for name in STATE_NAMES},
+        "calibrated_probabilities": {
+            name: float(latest_row[f"calibrated_p_{name}"]) for name in STATE_NAMES
+        },
+        "calibration_temperature": float(latest_row["calibration_temperature"]),
         "decision_weights": {name: float(latest_row[f"decision_p_{name}"]) for name in STATE_NAMES},
+        "decision_weight_source": "calibrated" if apply_to_decision else "ensemble",
+        "decision_half_life_days": half_life,
         "risk_score": float(latest_row["risk_score"]),
+        "risk_score_block_count": int(latest_row["risk_score_block_count"]),
+        "required_risk_blocks": required_blocks,
         "risk_percentile": float(latest_row["risk_percentile"]),
         "switch_probability": (
             float(latest_row["switch_probability"])
@@ -514,12 +749,32 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
         "model_weights": weight_values,
         "method": "causal baseline + diagonal GMM + forward-filtered diagonal HMM",
     }
-    target = _observable_target(risk_percentile)
-    evaluated_probabilities = {**probabilities, "ensemble": ensemble}
-    comparison = _model_comparison(evaluated_probabilities, target)
+    self_target = _observable_target(risk_percentile)
+    evaluated_probabilities = {
+        **probabilities,
+        "ensemble": ensemble,
+        "ensemble_calibrated": calibrated,
+    }
+    comparison = _model_comparison(
+        evaluated_probabilities, self_target, forward_target, climatology
+    )
+    if not comparison.empty and "beats_climatology" in comparison:
+        headline = comparison.loc[comparison["model"].eq("ensemble_calibrated")]
+        reference = comparison.loc[comparison["model"].eq("climatology")]
+        if not headline.empty and not reference.empty:
+            latest["forward_skill"] = {
+                "target": f"tercile of realised volatility over the next {forward_horizon} sessions",
+                "forward_brier": float(headline["paired_forward_brier"].iloc[0]),
+                "climatology_brier": float(headline["paired_climatology_brier"].iloc[0]),
+                "beats_climatology": bool(headline["beats_climatology"].iloc[0]),
+                "forward_hit_rate": float(headline["forward_hit_rate"].iloc[0]),
+                "climatology_hit_rate": float(reference["forward_hit_rate"].iloc[0]),
+                "observations": int(headline["paired_observations"].iloc[0]),
+                "note": "scored on the days this model and climatology both covered",
+            }
     decision_value = _decision_value(
         features,
-        {"baseline": baseline, "ensemble": ensemble},
+        {"baseline": baseline, "ensemble": ensemble, "ensemble_calibrated": calibrated},
         float(settings.get("evaluation_target_volatility", 0.10)),
     )
     return MarketStateResult(history, latest, columns, diagnostics, comparison, decision_value)

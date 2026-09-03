@@ -31,6 +31,39 @@ def _write_frame(frame: pd.DataFrame, path: Path) -> None:
         frame.to_parquet(path)
 
 
+def _feature_coverage(features: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
+    """Per-feature non-NaN coverage over the modelled panel.
+
+    The manifest checks whether a *source* arrived; nothing checked whether the
+    *feature* built from it actually exists. That gap is how hy_oas sat at 11%
+    coverage and downside_volatility_60 at 19% while every health row said ok.
+    """
+    settings = config["features"].get("coverage", {}) or {}
+    default_minimum = float(settings.get("default_min_coverage", 0.0))
+    rules = settings.get("rules", {}) or {}
+    total = len(features)
+    rows: list[dict[str, Any]] = []
+    for column in features.columns:
+        rule = rules.get(str(column), {}) or {}
+        present = int(features[column].count())
+        coverage = present / total if total else float("nan")
+        minimum = float(rule.get("min_coverage", default_minimum))
+        first_valid = features[column].first_valid_index()
+        rows.append(
+            {
+                "feature": str(column),
+                "rows": total,
+                "observations": present,
+                "coverage": coverage,
+                "min_coverage": minimum,
+                "required": bool(rule.get("required", False)),
+                "first_valid_date": "" if first_valid is None else str(first_valid.date()),
+                "status": "ok" if coverage >= minimum else "below_threshold",
+            }
+        )
+    return pd.DataFrame(rows).sort_values("coverage").reset_index(drop=True)
+
+
 def _eligible_bundle(bundle: PublicDataBundle, manifest: pd.DataFrame) -> PublicDataBundle:
     eligible = eligible_datasets(manifest)
     macro = bundle.macro[[column for column in bundle.macro if column in eligible]]
@@ -88,6 +121,15 @@ def run_pipeline(
         raise RuntimeError(f"Required data health checks failed: {details}")
     bundle = _eligible_bundle(bundle, manifest)
     features = build_features(bundle, config, as_of=clock.market_session)
+    coverage = _feature_coverage(features.market, config)
+    coverage.to_csv(reports / "feature_coverage.csv", index=False)
+    short = coverage.loc[coverage["required"] & coverage["status"].eq("below_threshold")]
+    if not short.empty:
+        details = ", ".join(
+            f"{row.feature}:{row.coverage:.1%}<{row.min_coverage:.0%}"
+            for row in short.itertuples(index=False)
+        )
+        raise RuntimeError(f"Required feature coverage below threshold: {details}")
     state = fit_market_state(features.market, config)
     style = fit_style(features.style_returns, config)
 
@@ -210,4 +252,5 @@ def run_pipeline(
         "model_comparison": reports / "model_comparison.csv",
         "model_diagnostics": reports / "model_refit_diagnostics.csv",
         "decision_value": reports / "decision_value_comparison.csv",
+        "feature_coverage": reports / "feature_coverage.csv",
     }

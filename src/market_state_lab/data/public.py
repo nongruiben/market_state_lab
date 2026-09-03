@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import random
 import re
 import time
@@ -16,6 +17,21 @@ import pandas as pd
 from market_state_lab.config import project_path
 from market_state_lab.data.alfred import load_initial_release_series
 from market_state_lab.data.http import CachedHttpClient
+
+_SECRET_QUERY_PARAMETERS = ("api_key", "apikey", "token")
+
+
+def _redact_secrets(text: str) -> str:
+    """Strip credentials out of anything headed for the manifest.
+
+    A failed ALFRED request raises with the full request URL attached, and that
+    string is written to data_manifest.csv and rendered into the dashboard HTML -
+    a file people share.
+    """
+    if not text:
+        return text
+    pattern = "|".join(_SECRET_QUERY_PARAMETERS)
+    return re.sub(rf"(?i)\b({pattern})=[^&\s\"']*", r"\1=***", text)
 
 
 @dataclass
@@ -72,17 +88,58 @@ class PublicDataLoader:
                 "earliest_date": earliest,
                 "latest_date": latest,
                 "vintage_mode": vintage_mode,
-                "error": error,
+                "error": _redact_secrets(error),
             }
         )
+
+    def _fred_graph_series(self, series_id: str, name: str) -> tuple[pd.DataFrame, str]:
+        """Keyless graph CSV. Full history for most series, but the licensed ICE
+        BofA spreads come back capped at a rolling ~3-year window regardless of
+        cosd/coed, which is why the coverage rules in source_health exist."""
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?" + urlencode({"id": series_id})
+        result = self.client.get(url, f"fred_{series_id}.csv")
+        raw = pd.read_csv(io.BytesIO(result.content))
+        raw.columns = [str(column).strip() for column in raw.columns]
+        series = pd.to_numeric(raw[raw.columns[-1]], errors="coerce")
+        series.index = pd.to_datetime(raw[raw.columns[0]], errors="coerce")
+        series.name = name
+        return self._clean_index(series.to_frame()).loc[self.start_date :], result.status
+
+    def _fred_api_series(self, series_id: str, name: str, api_key: str) -> tuple[pd.DataFrame, str]:
+        """Official observations endpoint. Returns the complete series, including
+        the ICE BofA spreads the graph CSV truncates."""
+        base = str(
+            self.config["data"]["fred"].get(
+                "api_base_url", "https://api.stlouisfed.org/fred/series/observations"
+            )
+        )
+        url = base + "?" + urlencode(
+            {
+                "series_id": series_id,
+                "api_key": api_key,
+                "file_type": "json",
+                "observation_start": self.start_date.date().isoformat(),
+                "limit": 100000,
+            }
+        )
+        result = self.client.get(url, f"fred_api_{series_id}.json")
+        payload: dict[str, Any] = json.loads(result.content.decode("utf-8"))
+        raw = pd.DataFrame(payload.get("observations", []))
+        if raw.empty:
+            raise ValueError(f"FRED API returned no observations for {series_id}")
+        series = pd.to_numeric(raw["value"], errors="coerce")
+        series.index = pd.to_datetime(raw["date"], errors="coerce")
+        series.name = name
+        frame = self._clean_index(series.to_frame()).dropna()
+        return frame.loc[self.start_date :], result.status
 
     def _fred(self) -> pd.DataFrame:
         section = self.config["data"]["fred"]
         vintage_mode = str(section.get("vintage_mode", "latest"))
+        api_key = os.getenv("FRED_API_KEY", "").strip()
+        use_api = bool(section.get("prefer_api", True)) and bool(api_key)
         frames: list[pd.Series] = []
         for name, series_id in section.get("series", {}).items():
-            # FRED's graph endpoint responds much faster without a server-side
-            # start-date filter; the small full history is filtered locally.
             try:
                 if vintage_mode == "point_in_time":
                     frame = load_initial_release_series(
@@ -91,21 +148,17 @@ class PublicDataLoader:
                     provider = "ALFRED"
                     status = "success"
                     record_vintage = "initial_release"
+                elif use_api:
+                    try:
+                        frame, status = self._fred_api_series(str(series_id), str(name), api_key)
+                        provider = "FRED API"
+                    except Exception:
+                        frame, status = self._fred_graph_series(str(series_id), str(name))
+                        provider = "FRED graph CSV (API fallback)"
+                    record_vintage = "latest_revised"
                 else:
-                    url = "https://fred.stlouisfed.org/graph/fredgraph.csv?" + urlencode(
-                        {"id": series_id}
-                    )
-                    result = self.client.get(url, f"fred_{series_id}.csv")
-                    raw = pd.read_csv(io.BytesIO(result.content))
-                    raw.columns = [str(column).strip() for column in raw.columns]
-                    date_column = raw.columns[0]
-                    value_column = raw.columns[-1]
-                    series = pd.to_numeric(raw[value_column], errors="coerce")
-                    series.index = pd.to_datetime(raw[date_column], errors="coerce")
-                    series.name = name
-                    frame = self._clean_index(series.to_frame()).loc[self.start_date :]
-                    provider = "FRED"
-                    status = result.status
+                    frame, status = self._fred_graph_series(str(series_id), str(name))
+                    provider = "FRED graph CSV"
                     record_vintage = "latest_revised"
                 frames.append(frame[name])
                 self._record(name, provider, frame, status, vintage_mode=record_vintage)
