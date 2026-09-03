@@ -28,6 +28,22 @@ def _figure_html(figure: go.Figure, include_plotly: bool | str) -> str:
     )
 
 
+def _absolute_suffix(latest: dict[str, Any]) -> str:
+    """Show the expanding-window percentile next to the rolling one.
+
+    A rolling percentile puts ~38% of every period in the high band, so on its
+    own it cannot distinguish a calm year from a crisis.
+    """
+    expanding = latest.get("risk_percentile_expanding")
+    band = latest.get("vix_band")
+    parts: list[str] = []
+    if isinstance(expanding, (int, float)):
+        parts.append(f"{float(expanding):.1%}")
+    if band:
+        parts.append(html.escape(str(band)))
+    return f" <span class='sub'>/ {' | '.join(parts)}</span>" if parts else ""
+
+
 def _table(frame: pd.DataFrame, columns: list[str] | None = None) -> str:
     if frame.empty:
         return '<p class="muted">No data available.</p>'
@@ -96,6 +112,37 @@ def write_dashboard(
         else "not enabled"
     )
 
+    # The report used to publish a headline state and a set of decision weights
+    # that can point the other way, with nothing saying which to act on.
+    half_life = float(config["models"]["market_state"].get("decision_half_life_days", 15))
+    decision_source = str(latest.get("decision_weight_source", "ensemble"))
+    decision_weights = latest.get("decision_weights", {}) or {}
+    if decision_weights:
+        leading = max(decision_weights, key=lambda name: decision_weights[name])
+        decision_line = (
+            f"Act on the decision weights: <strong>{html.escape(leading.replace('_', ' '))}</strong> "
+            f"at {decision_weights[leading]:.1%}, from the {html.escape(decision_source)} "
+            f"probabilities smoothed with a {half_life:g}-day half-life. The headline state above is "
+            f"the unsmoothed read and will lead the decision weights by roughly {half_life:g} "
+            f"trading days at a turn - when the two disagree, that lag is the reason."
+        )
+    else:
+        decision_line = "No decision weights were produced for this run."
+
+    skill = latest.get("forward_skill", {}) or {}
+    if skill:
+        verdict = "beats" if skill.get("beats_climatology") else "does NOT beat"
+        skill_line = (
+            f"Forward skill: the calibrated ensemble {verdict} the no-skill climatology on "
+            f"{html.escape(str(skill.get('target', '')))} - Brier "
+            f"{float(skill.get('forward_brier', float('nan'))):.3f} against "
+            f"{float(skill.get('climatology_brier', float('nan'))):.3f} over "
+            f"{int(skill.get('observations', 0)):,} paired days. The self-consistency Brier in the "
+            f"table below is not accuracy; it only measures agreement with the percentile rule."
+        )
+    else:
+        skill_line = "Forward skill was not evaluated for this run."
+
     document = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -121,6 +168,10 @@ section h2 {{ font-size:16px; margin:0 0 12px; letter-spacing:0; }}
 .data-table th,.data-table td {{ border-bottom:1px solid var(--line); padding:8px 7px; text-align:left; vertical-align:top; overflow-wrap:anywhere; }}
 .data-table th {{ background:#f7f8fa; font-weight:600; }}
 .muted,.note {{ color:var(--muted); font-size:12px; line-height:1.5; }}
+.callout {{ border-top:3px solid #17212b; margin-bottom:16px; }}
+.callout p {{ margin:0 0 8px; font-size:13px; line-height:1.6; }}
+.callout p:last-child {{ margin-bottom:0; color:var(--muted); }}
+.metric .sub {{ font-size:13px; color:var(--muted); font-weight:400; }}
 @media (max-width:780px) {{ .summary,.charts {{ grid-template-columns:1fr; }} main {{ padding:14px 10px 28px; }} }}
 </style>
 </head>
@@ -131,15 +182,16 @@ section h2 {{ font-size:16px; margin:0 0 12px; letter-spacing:0; }}
   <div class="metric"><span>As of</span><strong>{html.escape(str(latest['as_of']))}</strong></div>
   <div class="metric"><span>Risk state</span><strong>{html.escape(str(latest['market_state']).replace('_', ' ').title())}</strong></div>
   <div class="metric"><span>State confidence</span><strong>{latest['confidence']:.1%}</strong></div>
-  <div class="metric"><span>Risk percentile</span><strong>{latest['risk_percentile']:.1%}</strong></div>
+  <div class="metric"><span>Risk percentile (rolling / all history)</span><strong>{latest['risk_percentile']:.1%}{_absolute_suffix(latest)}</strong></div>
 </div>
+<section class="callout"><p>{decision_line}</p><p>{skill_line}</p></section>
 <div class="charts">
   <section>{_figure_html(probability_figure, 'inline' if config['reporting'].get('inline_plotly', True) else 'cdn')}</section>
   <section>{_figure_html(risk_figure, False)}</section>
 </div>
 <section>{_figure_html(style_figure, False)}</section>
 <section><h2>Model comparison</h2>{_table(state.comparison)}</section>
-<section><h2>Risk decision value</h2><p class="muted">Vol-only, baseline and ensemble use the same dates and one-day-lagged exposures. Figures exclude costs and are diagnostics, not a strategy backtest.</p>{_table(state.decision_value)}</section>
+<section><h2>Risk decision value</h2><p class="muted">All methods share the same dates and one-day-lagged exposures, net of transaction costs, with Sharpe measured excess of cash. significant_vs_buy_and_hold is the only column that answers whether a difference is real; a bootstrap interval spanning zero means the gap is noise. Diagnostics, not a strategy backtest.</p>{_table(state.decision_value)}</section>
 <section><h2>Latest style evidence</h2>{_table(style_table, ['dimension','favored_style','favored_strength','score','ff_score','etf_score','source_mode','source_agreement','as_of','age_business_days','data_status'])}</section>
 <section><h2>News overlay</h2><p class="muted">Status: {html.escape(news_status)}. This challenger signal is not an input to the state ensemble.</p>{_table(news_table)}</section>
 <section><h2>Data quality and freshness</h2>{_table(manifest_view)}</section>
