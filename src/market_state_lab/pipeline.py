@@ -98,6 +98,14 @@ def run_pipeline(
     processed = project_path(config, "data", "processed")
     reports = project_path(config, "reports")
     if offline:
+        # A fixture run used to write over the live dashboard, so reports/ could
+        # be holding synthetic numbers with nothing in the filename to say so.
+        # Keep the two worlds in separate directories.
+        reports = reports / "offline"
+        processed = processed / "offline"
+        reports.mkdir(parents=True, exist_ok=True)
+        processed.mkdir(parents=True, exist_ok=True)
+    if offline:
         bundle = load_offline_fixture(config)
         fixture_end = max(
             frame.index.max()

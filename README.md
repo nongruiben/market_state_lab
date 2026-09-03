@@ -82,6 +82,8 @@
 .\.venv\Scripts\market-state.exe run --offline
 ```
 
+离线运行的输出写到 `reports/offline/` 与 `data/processed/offline/`，**不会覆盖真实报告**。生成的 HTML 页首带 SYNTHETIC FIXTURE 横幅、`<title>` 也带前缀，因此不可能把合成结果误当成实盘结果。
+
 显式增加 IBKR 延迟快照：
 
 ```powershell

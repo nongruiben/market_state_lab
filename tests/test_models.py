@@ -8,7 +8,11 @@ from market_state_lab.config import load_config
 from market_state_lab.data.public import PublicDataBundle
 from market_state_lab.evaluation import synthetic_regime_metrics
 from market_state_lab.features import build_features
-from market_state_lab.models import fit_market_state, fit_style
+from market_state_lab.models import (
+    _forward_volatility_target,
+    fit_market_state,
+    fit_style,
+)
 
 
 def _synthetic_bundle() -> tuple[PublicDataBundle, pd.DatetimeIndex]:
@@ -210,6 +214,53 @@ def test_risk_score_keeps_one_fixed_block_composition() -> None:
     assert (history.loc[scored, "risk_score_block_count"] == len(required_blocks)).all()
     assert (history.loc[~scored, "risk_score_block_count"] < len(required_blocks)).all()
     assert state.latest["risk_score_block_count"] == len(required_blocks)
+
+
+def test_forward_target_thresholds_are_prefix_invariant() -> None:
+    """The outcome is future by design; the *labelling* must not be.
+
+    A tercile threshold built from outcomes that had not settled yet would hand
+    the model tomorrow's distribution, and every forward number in the repo would
+    silently become fiction.
+    """
+    bundle, dates = _synthetic_bundle()
+    config = load_config()
+    config["project"]["start_date"] = str(dates[0].date())
+    features = build_features(bundle, config, as_of=dates[-1]).market
+    returns = features["market_return"]
+
+    full = _forward_volatility_target(returns, 20, 756, 252)
+    prefix = _forward_volatility_target(returns.iloc[:900], 20, 756, 252)
+    # Only compare dates whose whole 20-session outcome window closed inside the
+    # prefix; past that the prefix genuinely cannot know the answer.
+    cutoff = prefix.index[-1] - pd.Timedelta(days=60)
+    left = full.loc[:cutoff].dropna()
+    right = prefix.loc[:cutoff].dropna()
+    common = left.index.intersection(right.index)
+    assert len(common) > 300
+    np.testing.assert_allclose(left.loc[common].to_numpy(), right.loc[common].to_numpy())
+
+
+def test_calibrated_ensemble_retains_forward_skill() -> None:
+    """Regression guard on the only result that means anything.
+
+    Every other test here checks plumbing, so a change that quietly pushed the
+    forecast back below no-skill would leave the suite green. On the 26-year live
+    panel the calibrated ensemble scores 0.621 against climatology 0.686; on this
+    synthetic bundle the margin is about -0.26. The floor below is deliberately
+    loose - it exists to catch a collapse, not to pin a number.
+    """
+    state, _ = _configured_state()
+    comparison = state.comparison.set_index("model")
+    calibrated = comparison.loc["ensemble_calibrated"]
+    raw = comparison.loc["ensemble"]
+
+    assert bool(calibrated["beats_climatology"])
+    assert calibrated["forward_brier_vs_climatology"] < -0.05
+    # Calibration is the step that bought the skill: it must not stop paying.
+    assert calibrated["paired_forward_brier"] < raw["paired_forward_brier"]
+    assert calibrated["forward_hit_rate"] > comparison.loc["climatology", "forward_hit_rate"]
+    assert state.latest["forward_skill"]["beats_climatology"] is True
 
 
 def test_calibration_softens_without_reordering_states() -> None:

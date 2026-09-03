@@ -129,6 +129,18 @@ def write_dashboard(
     else:
         decision_line = "No decision weights were produced for this run."
 
+    # A synthetic run has to announce itself on the page, not only in the JSON.
+    is_fixture = str(latest.get("point_in_time_status", "")) == "synthetic_fixture"
+    fixture_banner = (
+        '<section class="fixture">'
+        "<strong>SYNTHETIC FIXTURE</strong> - every number on this page comes from the offline "
+        "test fixture, not from market data. Run <code>scripts/run_daily.py</code> for the live "
+        "report.</section>"
+        if is_fixture
+        else ""
+    )
+    title = "SYNTHETIC - Market State Lab" if is_fixture else "Market State Lab"
+
     skill = latest.get("forward_skill", {}) or {}
     if skill:
         verdict = "beats" if skill.get("beats_climatology") else "does NOT beat"
@@ -148,7 +160,7 @@ def write_dashboard(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Market State Lab</title>
+<title>{html.escape(title)}</title>
 <style>
 :root {{ color-scheme: light; --ink:#20242a; --muted:#68707b; --line:#d9dde3; --paper:#ffffff; --band:#f4f6f8; }}
 * {{ box-sizing:border-box; }}
@@ -172,12 +184,15 @@ section h2 {{ font-size:16px; margin:0 0 12px; letter-spacing:0; }}
 .callout p {{ margin:0 0 8px; font-size:13px; line-height:1.6; }}
 .callout p:last-child {{ margin-bottom:0; color:var(--muted); }}
 .metric .sub {{ font-size:13px; color:var(--muted); font-weight:400; }}
+.fixture {{ background:#fdf2d0; border-top:3px solid #b8860b; color:#5a4405; font-size:13px; line-height:1.6; margin-bottom:16px; }}
+.fixture code {{ background:#f5e6b8; padding:1px 5px; border-radius:3px; }}
 @media (max-width:780px) {{ .summary,.charts {{ grid-template-columns:1fr; }} main {{ padding:14px 10px 28px; }} }}
 </style>
 </head>
 <body>
 <header><h1>Market State Lab</h1><p>US close-to-close research dashboard | read-only data workflow</p></header>
 <main>
+{fixture_banner}
 <div class="summary">
   <div class="metric"><span>As of</span><strong>{html.escape(str(latest['as_of']))}</strong></div>
   <div class="metric"><span>Risk state</span><strong>{html.escape(str(latest['market_state']).replace('_', ' ').title())}</strong></div>
