@@ -138,6 +138,13 @@ features:
     - risk_trend_breadth
     - risk_rates
   use_revision_prone_french_history: false
+  absolute_bands:
+    # risk_percentile is relative to a rolling 756-day window, so ~38% of days
+    # are high_risk in every period - a calm year and 2008 read identically.
+    # These give an absolute reference alongside it.
+    expanding_min_observations: 756
+    vix_levels: [15, 25, 40]
+    vix_labels: [calm, normal, stressed, crisis]
   coverage:
     # Written to reports/feature_coverage.csv every run. `required: true` fails the
     # run outright; `required: false` still reports below_threshold so a silently
@@ -172,6 +179,39 @@ models:
     covariance_type: diag
     reg_covar: 0.0001
     minimum_component_effective_observations: 25
+    feature_reduction:
+      # Opt-in, and deliberately OFF by default. Read this before flipping it.
+      #
+      # The regime features are collinear (volatility_20, volatility_60, vix_close
+      # and downside_volatility_60 are one factor). A diagonal covariance treats
+      # that redundancy as independent evidence and multiplies it, which is why
+      # posteriors saturate to 0/1 on most days. Projecting onto orthogonal
+      # components first fixes that, and PCA is refit per training slice.
+      #
+      # Measured on the 26-year live panel (GMM saturated-share / forward Brier):
+      #   none     0.778/1.003
+      #   n=2 diag 0.108/0.825   n=3 diag 0.114/0.863   n=4 diag 0.123/0.917
+      #   n=3 full 0.252/0.932   n=5 full 0.323/0.918
+      # covariance_type: full makes saturation worse, not better; PCA plus diag is
+      # the pairing that works, and n=2 wins on both axes.
+      #
+      # But it does NOT improve the number that matters: the calibrated ensemble
+      # sits at 0.621 with PCA and 0.620 without, because the dynamic weights give
+      # GMM/HMM only ~10% either way. And on the synthetic fixture it is clearly
+      # worse (regime recall 0.457 -> 0.358), because that generator draws each
+      # feature independently given the regime - exactly the assumption diag-GMM
+      # makes and exactly what real markets violate. So the fixture rewards
+      # over-counting redundant evidence and real data punishes it.
+      #
+      # Left off because it costs regime recall and buys nothing on the headline
+      # metric. The degeneracy it would fix is now reported instead: see the
+      # degenerate / saturated_share columns in model_refit_diagnostics.csv.
+      method: none
+      n_components: 2
+      whiten: true
+    # A fit can converge and still stop being probabilistic. Above this mean
+    # posterior the refit is flagged degenerate in model_refit_diagnostics.csv.
+    degenerate_max_responsibility: 0.99
     model_weights:
       baseline: 0.50
       gmm: 0.20
@@ -181,6 +221,18 @@ models:
     baseline_weight_floor: 0.40
     decision_half_life_days: 15
     evaluation_target_volatility: 0.10
+    decision_evaluation:
+      # 0.45 was hardcoded and never justified. It is a real knob - sweep it and
+      # report the sensitivity rather than trusting one arbitrary value.
+      high_risk_exposure_haircut: 0.45
+      # Charged on |change in exposure|. A signal that only wins gross is not a
+      # signal a person can trade.
+      transaction_cost_bps: 2.0
+      # Stationary block bootstrap on the Sharpe difference against buy-and-hold.
+      # Daily returns are autocorrelated, so blocks, not i.i.d. resampling.
+      bootstrap_draws: 500
+      bootstrap_block_days: 21
+      bootstrap_seed: 42
     evaluation:
       # External scoring target. The outcome is future by construction and is used
       # for scoring only; the tercile thresholds use only settled outcomes.

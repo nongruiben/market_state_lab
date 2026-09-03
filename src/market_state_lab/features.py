@@ -147,6 +147,9 @@ def build_features(
 
     passthrough = [
         "vix_close",
+        # Carried so decision_value can report a Sharpe excess of cash rather than
+        # excess of zero. Not a regime input: see PREFERRED_MODEL_COLUMNS.
+        "ff_rf",
         "macro_hy_oas",
         "macro_ig_oas",
         "macro_yield_curve_10y2y",

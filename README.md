@@ -23,6 +23,30 @@
 
 原始概率 `p_*`、校准后概率 `calibrated_p_*` 与 15 日半衰期的决策权重 `decision_p_*` 分别输出；`decision_*` 默认由校准后概率生成（`models.market_state.calibration.apply_to_decision`）。`latest_market_state.json` 的 `decision_weight_source` 和 `decision_half_life_days` 说明该按哪个数字行动——决策权重按设计滞后状态约 15 个交易日。
 
+### 决策价值：目前没有统计显著的优势
+
+`decision_value_comparison.csv` 现在含 buy-and-hold 对照、按 `daily_turnover` 计的交易成本（默认 2bp）、excess-of-cash 的 Sharpe，以及对 buy-and-hold 的 Sharpe 差的**分块 bootstrap 置信区间**（日收益自相关，故用分块而非 i.i.d. 重采样）。
+
+26 年真实数据上的结论要说清楚：buy-and-hold Sharpe 0.503，vol_only 0.557，ensemble 0.551，ensemble_calibrated 0.539，而**四个 CI 全部跨零，`significant_vs_buy_and_hold` 全为 False**。也就是说波动率目标化与状态叠加带来的 Sharpe 改善在统计上无法与噪声区分。真正稳健的收益是回撤：最大回撤从 −55.2% 降到 −22%~−26%。把它当风险控制工具是成立的，当收益增强工具则没有证据。
+
+仓位公式里的 0.45 已提为 `decision_evaluation.high_risk_exposure_haircut`，请扫描它而不是信任单一取值。
+
+### 相对分位之外的绝对口径
+
+`risk_percentile` 是对滚动 756 日窗口的分位，因此**任何时期都必然有约 38% 的天数落在 high 区**。现在并列输出 `risk_percentile_expanding`（对截至当日的全部历史排名，同样因果）与 `vix_band`（绝对水平带 calm/normal/stressed/crisis）。真实数据上，被滚动分位判为 high 的 2420 天里有 9.4% 在扩展分位上并不高——那些只是「相对最近三年高」。
+
+### GMM / HMM 的退化现在是可见的
+
+`model_refit_diagnostics.csv` 新增 `mean_max_responsibility`、`saturated_share`、`degenerate` 三列。真实数据上 GMM 有 29/50 次重估、HMM 有 39/50 次被判为退化（后验几乎全为 0/1）——此前这些重估一律报 `status: ok`。
+
+`feature_reduction.method: pca` 可以修掉它（GMM 饱和率 0.798 → 0.108，前瞻 Brier 1.003 → 0.825），**但默认关闭**：它对最终的校准集成毫无改善（0.620 vs 0.621），而且会让合成 fixture 的体制召回从 0.457 掉到 0.358。原因是该 fixture 在给定体制下独立抽取各特征，恰好符合 diag-GMM 的假设、也恰好是真实市场不满足的性质。配置文件里记录了完整的 sweep 与取舍。
+
+需要说明的是：在测过的任何配置下，GMM/HMM 都赢不了 climatology（0.686），也赢不了 baseline（0.753），最好一档是 0.825。它们在集成里的权重本来也只有约 10%。是否保留这 400 行是一个悬而未决的决定。
+
+### 模型特征不再冻结在 2003 年
+
+`_model_columns` 此前只用最初 756 行（2000–2003）判定一次可用特征，然后沿用 23 年——晚出现的序列永远进不来。现在每次重估都基于当次训练切片重新选择，门槛是切片长度的一个比例而非固定行数（否则窗口变长会悄悄放宽）。真实数据上特征数从 2002 年的 10 个增长到 2026 年的 12 个（`momentum_252` 与 `credit_risk_return_21` 在可用后自动加入），每次重估用了哪些特征都记录在 diagnostics 的 `feature_names` 列。
+
 ### risk_score 的口径是固定的
 
 `risk_score` 是 `features.required_risk_blocks` 里那几个 block 的均值，**永远是同一组**。此前它对「当天恰好可得的 block」取均值，于是在 HYG 历史开始前是 4-block 量、之后是 5-block 量，而滚动分位又把这两者放在同一个窗口里排名。现在缺任何一个必需 block 就直接输出 NaN，并同时给出 `risk_score_block_count`。`risk_credit` 暂时不在必需列表内，原因见下节。
@@ -116,12 +140,12 @@ ALFRED 数据按首次公开可得日索引，不再额外套固定发布滞后�
 ## 主要输出
 
 - `reports/market_state_dashboard.html`：综合报告。
-- `reports/latest_market_state.json`：原始概率、校准后概率、决策权重与其来源、模型权重、`risk_score_block_count`，以及 `forward_skill`（是否跑赢 climatology）。
+- `reports/latest_market_state.json`：原始概率、校准后概率、决策权重与其来源、模型权重、`risk_score_block_count`、`risk_percentile_expanding` 与 `vix_band`，以及 `forward_skill`（是否跑赢 climatology）。
 - `reports/market_state_history.parquet`：walk-forward 历史，含 `calibrated_p_*` 与 `calibration_temperature`。
 - `reports/model_comparison.csv`：`self_consistency_brier` 与 `forward_brier` 并列，含 climatology 行与配对技能差。
 - `reports/feature_coverage.csv`：逐特征覆盖率、阈值与是否达标。
-- `reports/decision_value_comparison.csv`：相对纯波动率控制的校准和回撤对照。
-- `reports/model_refit_diagnostics.csv`：每次 GMM/HMM 重估结果及空成分保护记录。
+- `reports/decision_value_comparison.csv`：含 buy-and-hold 对照、交易成本、excess-of-cash Sharpe 与 bootstrap 置信区间。
+- `reports/model_refit_diagnostics.csv`：每次重估的特征集、维度、后验饱和度与退化标记。
 - `reports/latest_style_state.csv`：FF/ETF 分列风格分数和一致性。
 - `reports/data_manifest.csv`：抓取状态、交易日年龄、历史深度与密度、阈值与模型可用性。
 

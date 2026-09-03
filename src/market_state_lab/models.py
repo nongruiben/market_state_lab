@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import warnings
+from bisect import bisect_right, insort
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -9,6 +10,7 @@ import numpy as np
 import pandas as pd
 from hmmlearn.hmm import GaussianHMM
 from scipy.special import logsumexp
+from sklearn.decomposition import PCA
 from sklearn.impute import SimpleImputer
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import RobustScaler
@@ -111,6 +113,36 @@ def _rolling_percentile(series: pd.Series, window: int) -> pd.Series:
     return series.rolling(window, min_periods=minimum).apply(last_rank, raw=True)
 
 
+def _expanding_percentile(series: pd.Series, minimum: int) -> pd.Series:
+    """Rank each value against everything seen up to that day, not a 756-day window.
+
+    The rolling percentile is purely relative, so ~38% of days are labelled
+    high_risk in every period including the calmest - 2017 and 2008 come out
+    looking identical. This is the same causal statistic without the forgetting.
+    """
+    values = series.to_numpy(dtype=float)
+    result = np.full(len(values), np.nan)
+    seen: list[float] = []
+    for position, value in enumerate(values):
+        if not np.isfinite(value):
+            continue
+        insort(seen, float(value))
+        if len(seen) >= minimum:
+            result[position] = bisect_right(seen, float(value)) / len(seen)
+    return pd.Series(result, index=series.index)
+
+
+def _absolute_band(series: pd.Series, thresholds: list[float], labels: list[str]) -> pd.Series:
+    """Fixed, interpretable levels - the anchor a relative percentile cannot give."""
+    band = pd.Series(pd.NA, index=series.index, dtype="object")
+    valid = series.notna()
+    edges = [-np.inf, *thresholds, np.inf]
+    for position, label in enumerate(labels):
+        selected = valid & series.gt(edges[position]) & series.le(edges[position + 1])
+        band.loc[selected] = label
+    return band
+
+
 def _baseline_probabilities(percentile: pd.Series) -> pd.DataFrame:
     low = _sigmoid((0.38 - percentile) / 0.10)
     high = _sigmoid((percentile - 0.62) / 0.10)
@@ -122,29 +154,45 @@ def _baseline_probabilities(percentile: pd.Series) -> pd.DataFrame:
     return probabilities.div(probabilities.sum(axis=1), axis=0)
 
 
-def _model_columns(features: pd.DataFrame, minimum_train: int) -> list[str]:
-    preferred = [
-        "volatility_20",
-        "volatility_60",
-        "downside_volatility_60",
-        "momentum_63",
-        "momentum_252",
-        "drawdown_252",
-        "vix_close",
-        "macro_hy_oas",
-        "macro_ig_oas",
-        "macro_yield_curve_10y2y",
-        "macro_financial_conditions",
-        "credit_risk_return_21",
-        "proxy_breadth",
-    ]
+PREFERRED_MODEL_COLUMNS = (
+    "volatility_20",
+    "volatility_60",
+    "downside_volatility_60",
+    "momentum_63",
+    "momentum_252",
+    "drawdown_252",
+    "vix_close",
+    "macro_hy_oas",
+    "macro_ig_oas",
+    "macro_yield_curve_10y2y",
+    "macro_financial_conditions",
+    "credit_risk_return_21",
+    "proxy_breadth",
+)
+
+
+def _candidate_columns(features: pd.DataFrame) -> list[str]:
+    preferred = list(PREFERRED_MODEL_COLUMNS)
     preferred.extend(column for column in features if column.startswith("ofr_") and "fsi" in column)
-    initial_window = features.iloc[: min(len(features), minimum_train)]
-    threshold = max(120, minimum_train // 2)
+    return [column for column in dict.fromkeys(preferred) if column in features]
+
+
+def _model_columns(
+    training_slice: pd.DataFrame,
+    minimum_fraction: float = 0.5,
+    absolute_minimum: int = 120,
+) -> list[str]:
+    """Pick the usable features from *this* training slice.
+
+    Selection used to run once against the first 756 rows - 2000 to 2003 - and
+    then hold for the next twenty-three years, so a series that only becomes
+    available later could never enter the model no matter how complete it was.
+    The bar is a fraction of the slice, not a fixed count, so it does not quietly
+    loosen as the training window grows.
+    """
+    threshold = max(absolute_minimum, int(minimum_fraction * len(training_slice)))
     return [
-        column
-        for column in dict.fromkeys(preferred)
-        if column in features and initial_window[column].count() >= threshold
+        column for column in training_slice.columns if training_slice[column].count() >= threshold
     ]
 
 
@@ -185,6 +233,25 @@ def _forward_filter(model: GaussianHMM, values: np.ndarray) -> tuple[np.ndarray,
     return np.exp(log_filtered), switch
 
 
+def _responsibility_health(published: np.ndarray, threshold: float) -> dict[str, Any]:
+    """Detect a fit that completed but stopped producing probabilities.
+
+    Every refit used to report status=ok while emitting one-hot labels on 68-84%
+    of days, because nothing looked at the responsibilities themselves. A mixture
+    whose posteriors are all ~1.0 is a clustering, not a probabilistic model, and
+    the Brier-based ensemble weights will correctly bury it - silently.
+    """
+    if published.size == 0:
+        return {"mean_max_responsibility": np.nan, "saturated_share": np.nan, "degenerate": False}
+    maximum = published.max(axis=1)
+    mean_max = float(maximum.mean())
+    return {
+        "mean_max_responsibility": mean_max,
+        "saturated_share": float((maximum > 0.9999).mean()),
+        "degenerate": bool(mean_max > threshold),
+    }
+
+
 def _fit_walk_forward_models(
     values: pd.DataFrame,
     risk_score: pd.Series,
@@ -201,6 +268,13 @@ def _fit_walk_forward_models(
     maximum_train = int(settings.get("maximum_train_observations", 0))
     refit_every = int(settings["refit_every_observations"])
     minimum_effective = float(settings.get("minimum_component_effective_observations", 25))
+    reduction = settings.get("feature_reduction", {}) or {}
+    reduction_method = str(reduction.get("method", "none")).lower()
+    reduction_components = int(reduction.get("n_components", 3))
+    reduction_whiten = bool(reduction.get("whiten", True))
+    degenerate_threshold = float(settings.get("degenerate_max_responsibility", 0.99))
+    column_fraction = float(settings.get("model_column_min_fraction", 0.5))
+    column_absolute_minimum = int(settings.get("model_column_min_observations", 120))
     valid_positions = np.flatnonzero(
         values.notna().sum(axis=1).to_numpy() >= max(2, len(values.columns) // 3)
     )
@@ -214,12 +288,50 @@ def _fit_walk_forward_models(
         test_positions = valid_positions[start_offset : start_offset + refit_every]
         if len(test_positions) == 0:
             break
-        train = values.iloc[train_positions]
-        test = values.iloc[test_positions]
+        train_candidates = values.iloc[train_positions]
+        columns = _model_columns(train_candidates, column_fraction, column_absolute_minimum)
+        if len(columns) < 3:
+            diagnostics.append(
+                {
+                    "train_end": str(train_candidates.index[-1].date()),
+                    "test_start": str(values.index[test_positions[0]].date()),
+                    "test_end": str(values.index[test_positions[-1]].date()),
+                    "train_rows": len(train_candidates),
+                    "test_rows": len(test_positions),
+                    "model_dimensions": 0,
+                    "explained_variance_ratio": np.nan,
+                    "source_features": len(columns),
+                    "feature_names": ",".join(columns),
+                    "model": "both",
+                    "status": "skipped",
+                    "detail": f"only {len(columns)} usable features in this training slice",
+                }
+            )
+            continue
+        train = train_candidates[columns]
+        test = values.iloc[test_positions][columns]
         imputer = SimpleImputer(strategy="median")
         scaler = RobustScaler(quantile_range=(10, 90))
         train_array = scaler.fit_transform(imputer.fit_transform(train))
         test_array = scaler.transform(imputer.transform(test))
+        # volatility_20 / volatility_60 / vix_close / downside_volatility_60 are one
+        # factor wearing four hats. A diagonal covariance treats them as independent
+        # evidence and multiplies the same signal repeatedly, so the log-likelihood
+        # gaps blow up and every responsibility saturates to 0 or 1 - the model
+        # stops being probabilistic at all. Projecting onto a few orthogonal
+        # components first is the direct fix. PCA is fitted on the training slice
+        # only, so this stays walk-forward.
+        explained_variance = np.nan
+        if reduction_method == "pca" and train_array.shape[1] > 1:
+            components = max(1, min(int(reduction_components), train_array.shape[1]))
+            reducer = PCA(
+                n_components=components,
+                whiten=bool(reduction_whiten),
+                random_state=random_seed,
+            )
+            train_array = reducer.fit_transform(train_array)
+            test_array = reducer.transform(test_array)
+            explained_variance = float(reducer.explained_variance_ratio_.sum())
         train_risk = risk_score.iloc[train_positions].to_numpy()
         common = {
             "train_end": str(train.index[-1].date()),
@@ -227,6 +339,10 @@ def _fit_walk_forward_models(
             "test_end": str(test.index[-1].date()),
             "train_rows": len(train),
             "test_rows": len(test),
+            "model_dimensions": int(train_array.shape[1]),
+            "explained_variance_ratio": explained_variance,
+            "source_features": len(columns),
+            "feature_names": ",".join(columns),
         }
 
         gmm_initializer: GaussianMixture | None = None
@@ -245,8 +361,11 @@ def _fit_walk_forward_models(
             )
             if order is None:
                 raise ValueError(f"underfilled component effective counts={effective.round(1).tolist()}")
-            outputs["gmm"].iloc[test_positions] = gmm.predict_proba(test_array)[:, order]
-            diagnostics.append({**common, "model": "gmm", "status": "ok", "detail": ""})
+            published = gmm.predict_proba(test_array)[:, order]
+            outputs["gmm"].iloc[test_positions] = published
+            diagnostics.append(
+                {**common, "model": "gmm", "status": "ok", "detail": "", **_responsibility_health(published, degenerate_threshold)}
+            )
         except Exception as exc:
             diagnostics.append({**common, "model": "gmm", "status": "skipped", "detail": str(exc)})
 
@@ -301,9 +420,12 @@ def _fit_walk_forward_models(
                 )
                 if order is None:
                     raise ValueError(f"underfilled state effective counts={effective.round(1).tolist()}")
-                outputs["hmm"].iloc[test_positions] = filtered[len(train_array) :, order]
+                published = filtered[len(train_array) :, order]
+                outputs["hmm"].iloc[test_positions] = published
                 switch_probability.iloc[test_positions] = switches[len(train_array) :]
-                diagnostics.append({**common, "model": "hmm", "status": "ok", "detail": ""})
+                diagnostics.append(
+                    {**common, "model": "hmm", "status": "ok", "detail": "", **_responsibility_health(published, degenerate_threshold)}
+                )
             except Exception as exc:
                 diagnostics.append({**common, "model": "hmm", "status": "skipped", "detail": str(exc)})
 
@@ -580,43 +702,130 @@ def _model_comparison(
     return comparison
 
 
+def _bootstrap_sharpe_interval(
+    excess: pd.Series,
+    reference: pd.Series,
+    draws: int,
+    block: int,
+    seed: int,
+) -> tuple[float, float]:
+    """Stationary block bootstrap on the Sharpe *difference* versus a reference.
+
+    Daily strategy returns are autocorrelated, so an i.i.d. bootstrap would give
+    a falsely tight interval; blocks preserve the local dependence. Without an
+    interval a 0.03 Sharpe gap reads as an improvement when it is noise.
+    """
+    paired = pd.concat([excess.rename("a"), reference.rename("b")], axis=1).dropna()
+    if len(paired) < max(252, block * 4):
+        return np.nan, np.nan
+    values = paired.to_numpy()
+    total = len(values)
+    blocks = int(np.ceil(total / block))
+    generator = np.random.default_rng(seed)
+    differences = np.empty(draws)
+    for draw in range(draws):
+        starts = generator.integers(0, total, size=blocks)
+        index = (starts[:, None] + np.arange(block)[None, :]).ravel()[:total] % total
+        sample = values[index]
+        spreads = []
+        for column in (0, 1):
+            series = sample[:, column]
+            deviation = series.std()
+            spreads.append(series.mean() / deviation * np.sqrt(252) if deviation > 0 else np.nan)
+        differences[draw] = spreads[0] - spreads[1]
+    finite = differences[np.isfinite(differences)]
+    if len(finite) < draws // 2:
+        return np.nan, np.nan
+    return float(np.percentile(finite, 2.5)), float(np.percentile(finite, 97.5))
+
+
 def _decision_value(
     features: pd.DataFrame,
     probabilities: dict[str, pd.DataFrame],
-    target_volatility: float,
+    settings: dict[str, Any],
+    risk_free: pd.Series | None = None,
 ) -> pd.DataFrame:
     if "market_return" not in features or "volatility_20" not in features:
         return pd.DataFrame()
+    evaluation = settings.get("decision_evaluation", {}) or {}
+    target_volatility = float(settings.get("evaluation_target_volatility", 0.10))
+    haircut = float(evaluation.get("high_risk_exposure_haircut", 0.45))
+    cost_bps = float(evaluation.get("transaction_cost_bps", 0.0))
+    draws = int(evaluation.get("bootstrap_draws", 500))
+    block = int(evaluation.get("bootstrap_block_days", 21))
+    seed = int(evaluation.get("bootstrap_seed", 42))
+
     vol_exposure = (target_volatility / features["volatility_20"]).clip(0.0, 1.5)
     common = features[["market_return", "volatility_20"]].notna().all(axis=1)
     for frame in probabilities.values():
         common &= frame.notna().all(axis=1)
-    rows: list[dict[str, Any]] = []
-    candidates: dict[str, pd.Series] = {"vol_only": vol_exposure}
+    # Buy-and-hold is the benchmark a person actually has the option of choosing.
+    # Comparing volatility-target variants only against each other cannot show
+    # whether any of this beats doing nothing.
+    candidates: dict[str, pd.Series] = {
+        "buy_and_hold": pd.Series(1.0, index=features.index),
+        "vol_only": vol_exposure,
+    }
     for name, frame in probabilities.items():
-        candidates[name] = vol_exposure * (1.0 - 0.45 * frame["p_high_risk"])
+        candidates[name] = vol_exposure * (1.0 - haircut * frame["p_high_risk"])
     applied_candidates = {name: exposure.shift(1) for name, exposure in candidates.items()}
-    for applied in applied_candidates.values():
-        common &= applied.notna()
     for name, applied in applied_candidates.items():
-        strategy_return = (applied * features["market_return"]).loc[common]
+        if name != "buy_and_hold":
+            common &= applied.notna()
+
+    daily_rate = (
+        risk_free.reindex(features.index).fillna(0.0)
+        if risk_free is not None
+        else pd.Series(0.0, index=features.index)
+    )
+    net_returns: dict[str, pd.Series] = {}
+    for name, applied in applied_candidates.items():
+        gross = applied * features["market_return"]
+        cost = applied.diff().abs().fillna(0.0) * (cost_bps / 10000.0)
+        net_returns[name] = (gross - cost).loc[common]
+
+    reference = net_returns.get("buy_and_hold")
+    rows: list[dict[str, Any]] = []
+    for name, strategy_return in net_returns.items():
         if len(strategy_return) < 126:
             continue
+        excess = strategy_return - daily_rate.loc[strategy_return.index]
         wealth = (1.0 + strategy_return).cumprod()
         drawdown = wealth / wealth.cummax() - 1.0
         rolling_vol = strategy_return.rolling(20, min_periods=20).std() * np.sqrt(252)
         annual_vol = float(strategy_return.std() * np.sqrt(252))
         annual_return = float((wealth.iloc[-1] ** (252.0 / len(strategy_return))) - 1.0)
+        excess_vol = float(excess.std() * np.sqrt(252))
+        sharpe = float(excess.mean() / excess.std() * np.sqrt(252)) if excess.std() > 0 else np.nan
+        low, high = (np.nan, np.nan)
+        if reference is not None and name != "buy_and_hold":
+            low, high = _bootstrap_sharpe_interval(
+                excess,
+                (reference - daily_rate.loc[reference.index]).loc[excess.index],
+                draws,
+                block,
+                seed,
+            )
         rows.append(
             {
                 "method": name,
                 "observations": len(strategy_return),
                 "annualized_return": annual_return,
                 "annualized_volatility": annual_vol,
+                "annualized_excess_volatility": excess_vol,
                 "volatility_target_mae": float((rolling_vol - target_volatility).abs().mean()),
                 "maximum_drawdown": float(drawdown.min()),
-                "sharpe_zero_rate": annual_return / annual_vol if annual_vol > 0 else np.nan,
-                "daily_turnover": float(applied.loc[common].diff().abs().mean()),
+                "sharpe_excess_of_cash": sharpe,
+                "sharpe_diff_vs_buy_and_hold_ci_low": low,
+                "sharpe_diff_vs_buy_and_hold_ci_high": high,
+                "significant_vs_buy_and_hold": bool(
+                    np.isfinite(low) and np.isfinite(high) and (low > 0 or high < 0)
+                ),
+                "transaction_cost_bps": cost_bps,
+                "high_risk_exposure_haircut": haircut,
+                "daily_turnover": float(
+                    applied_candidates[name].loc[strategy_return.index].diff().abs().mean()
+                ),
             }
         )
     return pd.DataFrame(rows)
@@ -625,7 +834,6 @@ def _decision_value(
 def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketStateResult:
     settings = config["models"]["market_state"]
     normalization_window = int(config["features"]["rolling_normalization_window"])
-    minimum_train = int(settings["minimum_train_observations"])
     random_seed = int(config["project"]["random_seed"])
 
     blocks = _risk_blocks(features, normalization_window)
@@ -645,14 +853,33 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
     risk_score_block_count = required_present.sum(axis=1).rename("risk_score_block_count")
     risk_blocks_available = blocks.notna().sum(axis=1).rename("risk_blocks_available")
     risk_percentile = _rolling_percentile(risk_score, normalization_window)
+    absolute = config["features"].get("absolute_bands", {}) or {}
+    risk_percentile_expanding = _expanding_percentile(
+        risk_score, int(absolute.get("expanding_min_observations", normalization_window))
+    ).rename("risk_percentile_expanding")
+    vix_thresholds = [float(value) for value in absolute.get("vix_levels", [15, 25, 40])]
+    vix_labels = [str(name) for name in absolute.get("vix_labels", ["calm", "normal", "stressed", "crisis"])]
+    if "vix_close" in features and len(vix_labels) == len(vix_thresholds) + 1:
+        vix_band = _absolute_band(features["vix_close"], vix_thresholds, vix_labels).rename("vix_band")
+    else:
+        vix_band = pd.Series(pd.NA, index=features.index, dtype="object", name="vix_band")
     baseline = _baseline_probabilities(risk_percentile)
-    columns = _model_columns(features, minimum_train)
-    if len(columns) < 3:
-        raise ValueError(f"Only {len(columns)} usable regime features; at least 3 are required")
+    candidates = _candidate_columns(features)
+    if len(candidates) < 3:
+        raise ValueError(f"Only {len(candidates)} candidate regime features; at least 3 are required")
 
     learned, switch_probability, diagnostics = _fit_walk_forward_models(
-        features[columns].copy(), risk_score, settings, random_seed
+        features[candidates].copy(), risk_score, settings, random_seed
     )
+    # The feature set is now chosen per refit, so report what the most recent
+    # successful refit actually used rather than a list frozen in 2003.
+    columns = candidates
+    if not diagnostics.empty and "feature_names" in diagnostics:
+        succeeded = diagnostics.loc[
+            diagnostics["status"].eq("ok") & diagnostics["feature_names"].astype(bool)
+        ]
+        if not succeeded.empty:
+            columns = str(succeeded["feature_names"].iloc[-1]).split(",")
     probabilities = {"baseline": baseline, **learned}
     ensemble, model_weights = _dynamic_ensemble(probabilities, risk_percentile, settings)
 
@@ -690,6 +917,8 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
             risk_score_block_count,
             risk_blocks_available,
             risk_percentile.rename("risk_percentile"),
+            risk_percentile_expanding,
+            vix_band,
             baseline.add_prefix("baseline_"),
             learned["gmm"].add_prefix("gmm_"),
             learned["hmm"].add_prefix("hmm_"),
@@ -740,6 +969,16 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
         "risk_score_block_count": int(latest_row["risk_score_block_count"]),
         "required_risk_blocks": required_blocks,
         "risk_percentile": float(latest_row["risk_percentile"]),
+        # The rolling percentile is relative to the last three years by
+        # construction; these two say where today sits on an absolute scale.
+        "risk_percentile_expanding": (
+            float(latest_row["risk_percentile_expanding"])
+            if np.isfinite(latest_row["risk_percentile_expanding"])
+            else None
+        ),
+        "vix_band": (
+            None if pd.isna(latest_row["vix_band"]) else str(latest_row["vix_band"])
+        ),
         "switch_probability": (
             float(latest_row["switch_probability"])
             if np.isfinite(latest_row["switch_probability"])
@@ -775,7 +1014,8 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
     decision_value = _decision_value(
         features,
         {"baseline": baseline, "ensemble": ensemble, "ensemble_calibrated": calibrated},
-        float(settings.get("evaluation_target_volatility", 0.10)),
+        settings,
+        risk_free=features["ff_rf"] if "ff_rf" in features else None,
     )
     return MarketStateResult(history, latest, columns, diagnostics, comparison, decision_value)
 
