@@ -64,8 +64,45 @@ def _block_score(
     return pd.concat(values, axis=1).mean(axis=1, skipna=True)
 
 
-def _risk_blocks(features: pd.DataFrame, window: int) -> pd.DataFrame:
-    ofr = [column for column in features if column.startswith("ofr_") and "fsi" in column]
+OFR_CATEGORY_COMPONENTS = (
+    "ofr_credit",
+    "ofr_equity_valuation",
+    "ofr_safe_assets",
+    "ofr_funding",
+    "ofr_volatility",
+)
+OFR_REGIONAL_COMPONENTS = (
+    "ofr_united_states",
+    "ofr_other_advanced_economies",
+    "ofr_emerging_markets",
+)
+
+
+def _ofr_columns(features: pd.DataFrame, mode: str) -> list[str]:
+    """Pick which OFR stress columns reach the model.
+
+    The five category components sum to the headline index exactly (corr 1.0000),
+    and so do the three regional ones, so headline-plus-everything would feed the
+    same information three times - the collinearity that saturates a diagonal
+    mixture. "categories" therefore *replaces* the headline rather than adding to
+    it, and the regional split is left out: it correlates 0.83-0.98 with the
+    headline and carries almost nothing new, whereas safe_assets sits at 0.31.
+    """
+    headline = [column for column in features if column.startswith("ofr_") and "fsi" in column]
+    if mode == "categories":
+        components = [column for column in OFR_CATEGORY_COMPONENTS if column in features]
+        return components or headline
+    if mode == "all":
+        return headline + [
+            column
+            for column in (*OFR_CATEGORY_COMPONENTS, *OFR_REGIONAL_COMPONENTS)
+            if column in features
+        ]
+    return headline
+
+
+def _risk_blocks(features: pd.DataFrame, window: int, ofr_mode: str = "headline") -> pd.DataFrame:
+    ofr = _ofr_columns(features, ofr_mode)
     blocks = {
         "risk_volatility": _block_score(
             features,
@@ -171,9 +208,9 @@ PREFERRED_MODEL_COLUMNS = (
 )
 
 
-def _candidate_columns(features: pd.DataFrame) -> list[str]:
+def _candidate_columns(features: pd.DataFrame, ofr_mode: str = "headline") -> list[str]:
     preferred = list(PREFERRED_MODEL_COLUMNS)
-    preferred.extend(column for column in features if column.startswith("ofr_") and "fsi" in column)
+    preferred.extend(_ofr_columns(features, ofr_mode))
     return [column for column in dict.fromkeys(preferred) if column in features]
 
 
@@ -836,7 +873,10 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
     normalization_window = int(config["features"]["rolling_normalization_window"])
     random_seed = int(config["project"]["random_seed"])
 
-    blocks = _risk_blocks(features, normalization_window)
+    ofr_settings = config["features"].get("ofr_components", {}) or {}
+    ofr_block_mode = str(ofr_settings.get("in_risk_block", "headline"))
+    ofr_model_mode = str(ofr_settings.get("in_model_features", "headline"))
+    blocks = _risk_blocks(features, normalization_window, ofr_block_mode)
     # A mean over "whatever blocks happen to exist today" is not one quantity: it
     # was a 4-block mean before HYG history begins and a 5-block mean after, and
     # _rolling_percentile then ranked today's value against a window built from the
@@ -864,7 +904,7 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
     else:
         vix_band = pd.Series(pd.NA, index=features.index, dtype="object", name="vix_band")
     baseline = _baseline_probabilities(risk_percentile)
-    candidates = _candidate_columns(features)
+    candidates = _candidate_columns(features, ofr_model_mode)
     if len(candidates) < 3:
         raise ValueError(f"Only {len(candidates)} candidate regime features; at least 3 are required")
 

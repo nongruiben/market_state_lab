@@ -138,6 +138,27 @@ features:
     - risk_trend_breadth
     - risk_rates
   use_revision_prone_french_history: false
+  ofr_components:
+    # Tested and rejected - kept switchable so nobody spends a day rediscovering
+    # this. The OFR feed ships the headline stress index plus eight sub-indices,
+    # all at 100% coverage, and only the headline was ever used. It looked like
+    # free macro breadth. It is not: the five category components sum to the
+    # headline exactly (corr 1.0000) and so do the three regional ones, so they
+    # are two redundant decompositions of one number rather than new information.
+    #
+    # Calibrated forward Brier against the headline-only reference (0.6260),
+    # paired per-day, 21-day block bootstrap:
+    #   categories -> risk block      0.6263  -0.0003  [-0.0032, +0.0026]  ns
+    #   categories -> model features  0.6265  -0.0005  [-0.0039, +0.0032]  ns
+    #   categories -> both            0.6276  -0.0016  [-0.0051, +0.0019]  ns
+    #   all 8 + headline -> both      0.6202  +0.0058  [+0.0017, +0.0098]  sig
+    # The only significant variant is the one with the worst justification, and
+    # it fails the two-window rule: +0.0112 [+0.0053, +0.0173] before 2013 and
+    # +0.0009 [-0.0045, +0.0063] after. The effect is a pre-2013 relic.
+    #
+    # headline | categories | all
+    in_risk_block: headline
+    in_model_features: headline
   absolute_bands:
     # risk_percentile is relative to a rolling 756-day window, so ~38% of days
     # are high_risk in every period - a calm year and 2008 read identically.
