@@ -23,11 +23,36 @@
 
 原始概率 `p_*`、校准后概率 `calibrated_p_*` 与 15 日半衰期的决策权重 `decision_p_*` 分别输出；`decision_*` 默认由校准后概率生成（`models.market_state.calibration.apply_to_decision`）。`latest_market_state.json` 的 `decision_weight_source` 和 `decision_half_life_days` 说明该按哪个数字行动——决策权重按设计滞后状态约 15 个交易日。
 
-### 决策价值：目前没有统计显著的优势
+### 决策价值：Sharpe 是错的尺子，回撤才是
 
-`decision_value_comparison.csv` 现在含 buy-and-hold 对照、按 `daily_turnover` 计的交易成本（默认 2bp）、excess-of-cash 的 Sharpe，以及对 buy-and-hold 的 Sharpe 差的**分块 bootstrap 置信区间**（日收益自相关，故用分块而非 i.i.d. 重采样）。
+先看数据说了什么。按模型预测的状态分组，未来 20 个交易日：
 
-26 年真实数据上的结论要说清楚：buy-and-hold Sharpe 0.503，vol_only 0.557，ensemble 0.551，ensemble_calibrated 0.539，而**四个 CI 全部跨零，`significant_vs_buy_and_hold` 全为 False**。也就是说波动率目标化与状态叠加带来的 Sharpe 改善在统计上无法与噪声区分。真正稳健的收益是回撤：最大回撤从 −55.2% 降到 −22%~−26%。把它当风险控制工具是成立的，当收益增强工具则没有证据。
+| 预测状态 | 年化收益 | 95% CI | 年化波动 | 1% 分位收益 |
+|---|---|---|---|---|
+| low_risk | +12.08% | [+6.81%, +17.42%] | 12.4% | −9.14% |
+| high_risk | +10.22% | [+1.02%, +19.24%] | 19.4% | −17.24% |
+
+**收益差 −1.86%，CI [−4.95%, +1.22%]，不显著。波动差 +7.0 个百分点，尾部差近一倍。**
+
+这解释了一件长期困惑的事：预测命中率从 49.4% 提到 54.8%，Sharpe 却纹丝不动。高风险时期的期望收益和低风险时期一样，只是波动大 57%——在高风险时降仓，收益与波动**等比例**下降，Sharpe 必然不变。这不是仓位公式没调好，**任何仓位公式都救不了，因为根本没有可供利用的收益差**。
+
+所以 `decision_value_comparison.csv` 现在两把尺子并列。Sharpe 一侧的结论没变（对 buy-and-hold 全部不显著），回撤一侧则是另一回事：
+
+| 方法 | 最大回撤 | 平均回撤 | 条件回撤(worst 5%) | Calmar | 1%尾部(20日) |
+|---|---|---|---|---|---|
+| buy_and_hold | −55.2% | −7.45% | −38.2% | 0.18 | −12.76% |
+| vol_only | −26.0% | −5.29% | −19.6% | 0.29 | −6.49% |
+| ensemble_calibrated | −21.1% | −4.59% | −16.1% | 0.31 | −5.63% |
+
+关键对照是 **vol_only 而不是 buy-and-hold**——vol_only 就是同一策略去掉状态层，所以差额恰好是状态层的贡献。`drawdown_reduction_vs_vol_only_*`（正值 = 回撤更浅）配对分块 bootstrap：
+
+- baseline [−0.0022, +0.0220] 不显著
+- ensemble [−0.0015, +0.0223] 不显著
+- **ensemble_calibrated [+0.0027, +0.0202] 显著**
+
+**只有校准后的集成显著优于纯波动率目标化。** 这是决策侧第一个统计显著的结果，也再一次说明校准层不是装饰。
+
+注意最大回撤是单条路径的一个次序统计量，重采样它意义不大，所以显著性检验用的是**平均回撤深度**——同一个概念的可估计版本，且两条路径用同一组 block 索引重采样，保证同口径对比。
 
 仓位公式里的 0.45 已提为 `decision_evaluation.high_risk_exposure_haircut`，请扫描它而不是信任单一取值。
 

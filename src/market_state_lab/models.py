@@ -776,12 +776,73 @@ def _bootstrap_sharpe_interval(
     return float(np.percentile(finite, 2.5)), float(np.percentile(finite, 97.5))
 
 
+def _drawdown_depth(returns: np.ndarray) -> tuple[float, float, float]:
+    """Worst, average and conditional (worst 5%) drawdown depth of one path."""
+    wealth = np.cumprod(1.0 + returns)
+    drawdown = wealth / np.maximum.accumulate(wealth) - 1.0
+    cutoff = np.quantile(drawdown, 0.05)
+    conditional = drawdown[drawdown <= cutoff]
+    return (
+        float(drawdown.min()),
+        float(drawdown.mean()),
+        float(conditional.mean()) if len(conditional) else float("nan"),
+    )
+
+
+def _bootstrap_drawdown_interval(
+    strategy: pd.Series,
+    reference: pd.Series,
+    draws: int,
+    block: int,
+    seed: int,
+) -> tuple[float, float]:
+    """Block bootstrap the *reduction* in average drawdown depth.
+
+    Returned as strategy minus reference on a quantity that is negative, so a
+    POSITIVE number means the strategy's drawdowns are shallower. The naming
+    says "reduction" precisely so the sign cannot be read backwards.
+
+    Maximum drawdown is a single order statistic of one path and resampling it
+    is close to meaningless; average depth is the same idea made estimable.
+    Both series are resampled on the *same* block indices so the two paths see
+    the same synthetic market and the difference stays like-for-like.
+    """
+    paired = pd.concat([strategy.rename("a"), reference.rename("b")], axis=1).dropna()
+    if len(paired) < max(252, block * 4):
+        return np.nan, np.nan
+    values = paired.to_numpy()
+    total = len(values)
+    blocks = int(np.ceil(total / block))
+    generator = np.random.default_rng(seed)
+    differences = np.empty(draws)
+    for draw in range(draws):
+        starts = generator.integers(0, total, size=blocks)
+        index = (starts[:, None] + np.arange(block)[None, :]).ravel()[:total] % total
+        sample = values[index]
+        differences[draw] = _drawdown_depth(sample[:, 0])[1] - _drawdown_depth(sample[:, 1])[1]
+    finite = differences[np.isfinite(differences)]
+    if len(finite) < draws // 2:
+        return np.nan, np.nan
+    return float(np.percentile(finite, 2.5)), float(np.percentile(finite, 97.5))
+
+
 def _decision_value(
     features: pd.DataFrame,
     probabilities: dict[str, pd.DataFrame],
     settings: dict[str, Any],
     risk_free: pd.Series | None = None,
 ) -> pd.DataFrame:
+    """Score the exposure rules on drawdown as well as on Sharpe.
+
+    Sharpe is the wrong yardstick for this signal and the data says so: forward
+    20-session returns are statistically identical across the three predicted
+    states (high minus low: -1.86%/yr, CI [-4.95%, +1.22%]) while forward
+    volatility differs by 7 points and the 1% return tail differs by nearly 2x
+    (-9.1% vs -17.2%). A rule that de-risks on this signal cuts return and
+    volatility together, so Sharpe cannot move - but the tail can. Drawdown is
+    therefore measured against vol_only, which is the same strategy *without*
+    the state, so the comparison isolates what the state actually adds.
+    """
     if "market_return" not in features or "volatility_20" not in features:
         return pd.DataFrame()
     evaluation = settings.get("decision_evaluation", {}) or {}
@@ -822,18 +883,21 @@ def _decision_value(
         net_returns[name] = (gross - cost).loc[common]
 
     reference = net_returns.get("buy_and_hold")
+    state_reference = net_returns.get("vol_only")
     rows: list[dict[str, Any]] = []
     for name, strategy_return in net_returns.items():
         if len(strategy_return) < 126:
             continue
         excess = strategy_return - daily_rate.loc[strategy_return.index]
         wealth = (1.0 + strategy_return).cumprod()
-        drawdown = wealth / wealth.cummax() - 1.0
         rolling_vol = strategy_return.rolling(20, min_periods=20).std() * np.sqrt(252)
         annual_vol = float(strategy_return.std() * np.sqrt(252))
         annual_return = float((wealth.iloc[-1] ** (252.0 / len(strategy_return))) - 1.0)
         excess_vol = float(excess.std() * np.sqrt(252))
         sharpe = float(excess.mean() / excess.std() * np.sqrt(252)) if excess.std() > 0 else np.nan
+        worst, average, conditional = _drawdown_depth(strategy_return.to_numpy())
+        horizon_return = strategy_return.rolling(20, min_periods=20).sum()
+
         low, high = (np.nan, np.nan)
         if reference is not None and name != "buy_and_hold":
             low, high = _bootstrap_sharpe_interval(
@@ -843,6 +907,13 @@ def _decision_value(
                 block,
                 seed,
             )
+        # Against vol_only, not buy-and-hold: vol_only is this same strategy with
+        # the state layer removed, so the gap is exactly what the state buys.
+        drawdown_low, drawdown_high = (np.nan, np.nan)
+        if state_reference is not None and name not in {"buy_and_hold", "vol_only"}:
+            drawdown_low, drawdown_high = _bootstrap_drawdown_interval(
+                strategy_return, state_reference.loc[strategy_return.index], draws, block, seed
+            )
         rows.append(
             {
                 "method": name,
@@ -851,12 +922,24 @@ def _decision_value(
                 "annualized_volatility": annual_vol,
                 "annualized_excess_volatility": excess_vol,
                 "volatility_target_mae": float((rolling_vol - target_volatility).abs().mean()),
-                "maximum_drawdown": float(drawdown.min()),
+                "maximum_drawdown": worst,
+                "average_drawdown": average,
+                "conditional_drawdown_95": conditional,
+                "calmar_ratio": annual_return / abs(worst) if worst < 0 else np.nan,
+                "tail_loss_5pct_20d": float(horizon_return.quantile(0.05)),
+                "tail_loss_1pct_20d": float(horizon_return.quantile(0.01)),
                 "sharpe_excess_of_cash": sharpe,
                 "sharpe_diff_vs_buy_and_hold_ci_low": low,
                 "sharpe_diff_vs_buy_and_hold_ci_high": high,
                 "significant_vs_buy_and_hold": bool(
                     np.isfinite(low) and np.isfinite(high) and (low > 0 or high < 0)
+                ),
+                "drawdown_reduction_vs_vol_only_ci_low": drawdown_low,
+                "drawdown_reduction_vs_vol_only_ci_high": drawdown_high,
+                "drawdown_significant_vs_vol_only": bool(
+                    np.isfinite(drawdown_low)
+                    and np.isfinite(drawdown_high)
+                    and (drawdown_low > 0 or drawdown_high < 0)
                 ),
                 "transaction_cost_bps": cost_bps,
                 "high_risk_exposure_haircut": haircut,

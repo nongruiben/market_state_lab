@@ -263,6 +263,43 @@ def test_calibrated_ensemble_retains_forward_skill() -> None:
     assert state.latest["forward_skill"]["beats_climatology"] is True
 
 
+def test_decision_value_scores_drawdown_against_the_no_state_benchmark() -> None:
+    """Sharpe is the wrong yardstick for this signal, so both must be reported.
+
+    Forward returns are statistically identical across the three predicted states
+    while the return tail differs by nearly 2x, so a de-risking rule cannot move
+    Sharpe but can move drawdown. The drawdown comparison is against vol_only -
+    the same strategy without the state - because that is the only benchmark that
+    isolates what the state contributes.
+    """
+    state, _ = _configured_state()
+    value = state.decision_value.set_index("method")
+    assert {"buy_and_hold", "vol_only", "ensemble_calibrated"}.issubset(value.index)
+    for column in (
+        "maximum_drawdown",
+        "average_drawdown",
+        "conditional_drawdown_95",
+        "calmar_ratio",
+        "tail_loss_5pct_20d",
+        "tail_loss_1pct_20d",
+        "sharpe_excess_of_cash",
+        "drawdown_reduction_vs_vol_only_ci_low",
+        "drawdown_reduction_vs_vol_only_ci_high",
+    ):
+        assert column in value.columns
+    # Drawdown depths are negative, and the conditional one is the deeper tail.
+    for method in ("buy_and_hold", "vol_only", "ensemble_calibrated"):
+        row = value.loc[method]
+        assert row["maximum_drawdown"] <= row["conditional_drawdown_95"] <= 0
+        assert row["average_drawdown"] <= 0
+        assert row["tail_loss_1pct_20d"] <= row["tail_loss_5pct_20d"]
+    # The benchmark cannot be compared with itself.
+    assert not np.isfinite(value.loc["vol_only", "drawdown_reduction_vs_vol_only_ci_low"])
+    assert np.isfinite(value.loc["ensemble_calibrated", "drawdown_reduction_vs_vol_only_ci_low"])
+    # Volatility targeting must at least beat holding the index outright.
+    assert value.loc["vol_only", "maximum_drawdown"] > value.loc["buy_and_hold", "maximum_drawdown"]
+
+
 def test_calibration_softens_without_reordering_states() -> None:
     state, _ = _configured_state()
     history = state.history
