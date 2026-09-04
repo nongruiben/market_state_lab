@@ -111,9 +111,18 @@ def _risk_blocks(features: pd.DataFrame, window: int, ofr_mode: str = "headline"
             [],
             window,
         ),
+        # macro_baa_spread and credit_quality_spread come from Moody's, which the
+        # keyless FRED path serves complete back to 1986 - unlike the licensed ICE
+        # OAS series, which arrive truncated to ~3 years and drop out on coverage.
+        # That is what finally lets this block hold a full history.
         "risk_credit": _block_score(
             features,
-            ["macro_hy_oas", "macro_ig_oas"],
+            [
+                "macro_hy_oas",
+                "macro_ig_oas",
+                "macro_baa_spread",
+                "credit_quality_spread",
+            ],
             ["credit_risk_return_21"],
             window,
         ),

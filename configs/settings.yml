@@ -29,8 +29,17 @@ data:
     prefer_api: true
     api_base_url: "https://api.stlouisfed.org/fred/series/observations"
     series:
+      # ICE BofA OAS. Licensed, so the keyless graph CSV caps them at a rolling
+      # ~3 years and they fail their coverage rule. Kept so a FRED_API_KEY would
+      # light them up, but the credit block no longer depends on them.
       hy_oas: BAMLH0A0HYM2
       ig_oas: BAMLC0A0CM
+      # Moody's is not licensed the same way and comes back complete without a
+      # key: baa_spread 10,610 rows from 1986, aaa_spread 11,393 from 1983 -
+      # longer than the ICE series would give even with one. Baa minus the 10y
+      # Treasury is the classic default spread of the asset-pricing literature.
+      baa_spread: BAA10Y
+      aaa_spread: AAA10Y
       yield_curve_10y2y: T10Y2Y
       yield_curve_10y3m: T10Y3M
       financial_conditions: NFCI
@@ -128,6 +137,8 @@ data:
       vix: {required: true, max_age_business_days: 3, min_history_years: 15, min_observation_density: 0.9}
       spy: {required: true, max_age_business_days: 3, min_history_years: 15, min_observation_density: 0.9}
       hy_oas: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
+      baa_spread: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
+      aaa_spread: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
       ig_oas: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
       yield_curve_10y2y: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
       yield_curve_10y3m: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
@@ -159,8 +170,17 @@ features:
   # risk_score is the mean of exactly these blocks, always. Averaging "whatever is
   # available" made it a 4-block quantity before HYG history starts and a 5-block
   # quantity after, which the rolling percentile then ranked against each other.
-  # risk_credit stays out until an ICE-licensed FRED history is reachable; see
-  # data.fred.prefer_api. Promote it here once hy_oas passes its coverage rule.
+  # risk_credit stays out, but no longer for lack of data. Moody's BAA10Y and
+  # AAA10Y gave the block 97.3% coverage from 2000 without any API key, and it
+  # still does not help: promoting it moves the calibrated forward Brier
+  # 0.5721 -> 0.5821, CI [-0.0227, +0.0017] - not significant but negative in
+  # both halves (-0.0117 / -0.0084), with average drawdown unchanged. As model
+  # features instead: -0.0008, also nothing.
+  #
+  # Same diagnosis as risk_rates. Credit spreads are a quarters-to-years default
+  # cycle variable being asked about the next 20 sessions, and the near-term
+  # stress they would signal is already in the volatility block. Reconsider both
+  # together if the target ever moves to a multi-month horizon.
   #
   # risk_rates is out because it was making the forecast worse, not better. The
   # yield curve is a 12-18 month recession indicator being asked about the next

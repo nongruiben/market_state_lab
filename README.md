@@ -194,6 +194,10 @@ ALFRED 数据按首次公开可得日索引，不再额外套固定发布滞后�
 
 要真正拿回这两条序列的完整历史，需要一个免费的 FRED API key：设置 `FRED_API_KEY` 后，`data.fred.prefer_api` 会走官方 observations 端点（失败时回退 graph CSV，provider 字段会标明）。没有 key 时它们会以 `truncated` 明确失败，而不是无声地从模型里消失。
 
+**但信用利差已经不再依赖它们。** 受限的只是 ICE BofA 授权序列；穆迪的 `BAA10Y`（Baa 级公司债 − 10 年美债）和 `AAA10Y` 在同一个 keyless 端点上返回完整历史，原始序列分别回溯到 1986 和 1983 年，比 ICE（1996 起）更长。Baa−10Y 是资产定价文献里的经典违约利差，`credit_quality_spread`（Baa−Aaa）则剥掉国债腿只留纯信用质量。三者在特征面板上都是 100% 覆盖率。
+
+结果是 `risk_credit` 的覆盖率从依赖 11% 的序列变成 97.3%（2000-09 起）——但**它仍然没有进 `required_risk_blocks`，因为对这个目标没用**：提升它会让校准前瞻 Brier 从 0.5721 退到 0.5821，CI [−0.0227, +0.0017] 不显著但两个半区都为负，平均回撤不变。诊断和期限利差完全相同——季度到年度尺度的违约周期变量，回答不了未来 20 天的波动率问题，而近端压力已经被波动率 block 覆盖。若将来改成多月期限目标，这两个 block 应一起重新考虑。
+
 每次运行还会输出 `reports/feature_coverage.csv`：逐特征的非空覆盖率。`required: true` 的特征低于阈值会让运行直接失败，`required: false` 的仍会标 `below_threshold`。
 
 ## 主要输出

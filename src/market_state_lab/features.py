@@ -152,6 +152,8 @@ def build_features(
         "ff_rf",
         "macro_hy_oas",
         "macro_ig_oas",
+        "macro_baa_spread",
+        "macro_aaa_spread",
         "macro_yield_curve_10y2y",
         "macro_yield_curve_10y3m",
         "macro_financial_conditions",
@@ -177,6 +179,9 @@ def build_features(
         market["credit_risk_return_21"] = _rolling_compound(
             source["ret_hyg"] - source["ret_lqd"], 21
         )
+    # Baa minus Aaa strips out the Treasury leg, leaving pure credit quality.
+    if {"macro_baa_spread", "macro_aaa_spread"}.issubset(market.columns):
+        market["credit_quality_spread"] = market["macro_baa_spread"] - market["macro_aaa_spread"]
     proxy_return_columns = [
         column
         for column in ("ret_spy", "ret_qqq", "ret_rsp", "ret_iwm", "ret_hyg", "ret_lqd")
