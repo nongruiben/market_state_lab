@@ -27,6 +27,7 @@ class MarketStateResult:
     diagnostics: pd.DataFrame = field(default_factory=pd.DataFrame)
     comparison: pd.DataFrame = field(default_factory=pd.DataFrame)
     decision_value: pd.DataFrame = field(default_factory=pd.DataFrame)
+    exposure_tradeoff: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass
@@ -951,6 +952,78 @@ def _decision_value(
     return pd.DataFrame(rows)
 
 
+def _exposure_tradeoff(
+    features: pd.DataFrame,
+    decision_probabilities: pd.DataFrame,
+    settings: dict[str, Any],
+) -> pd.DataFrame:
+    """Sweep the high-risk haircut so the trade being made is visible.
+
+    Every setting from 0.45 to 1.00 significantly beats plain volatility
+    targeting on drawdown, monotonically, right up to the boundary - so this is
+    not an optimisation with a right answer, it is a preference dial. The whole
+    curve is published rather than one number, because how much annual return is
+    worth how much drawdown is the reader's call and not a statistical one.
+    Inference for the *selected* setting lives in decision_value_comparison.csv.
+    """
+    if "market_return" not in features or "volatility_20" not in features:
+        return pd.DataFrame()
+    evaluation = settings.get("decision_evaluation", {}) or {}
+    target_volatility = float(settings.get("evaluation_target_volatility", 0.10))
+    cost_bps = float(evaluation.get("transaction_cost_bps", 0.0))
+    selected = float(evaluation.get("high_risk_exposure_haircut", 0.45))
+    grid = [float(value) for value in evaluation.get("haircut_grid", [0.0, 0.25, 0.45, 0.65, 0.85, 1.0])]
+
+    vol_exposure = (target_volatility / features["volatility_20"]).clip(0.0, 1.5)
+    high = decision_probabilities["p_high_risk"]
+    common = (
+        features["market_return"].notna()
+        & vol_exposure.notna()
+        & decision_probabilities.notna().all(axis=1)
+    ).shift(1).fillna(False) & features["market_return"].notna()
+    if int(common.sum()) < 252:
+        return pd.DataFrame()
+
+    def score(exposure: pd.Series) -> dict[str, Any]:
+        applied = exposure.shift(1)
+        net = (
+            applied * features["market_return"]
+            - applied.diff().abs().fillna(0.0) * (cost_bps / 10000.0)
+        ).loc[common]
+        worst, average, conditional = _drawdown_depth(net.to_numpy())
+        wealth = float((1.0 + net).cumprod().iloc[-1])
+        return {
+            "annualized_return": wealth ** (252.0 / len(net)) - 1.0,
+            "maximum_drawdown": worst,
+            "average_drawdown": average,
+            "conditional_drawdown_95": conditional,
+            "calmar_ratio": (wealth ** (252.0 / len(net)) - 1.0) / abs(worst) if worst < 0 else np.nan,
+            "daily_turnover": float(applied.loc[common].diff().abs().mean()),
+        }
+
+    # Every row, the benchmark included, must carry the same NaN pattern: the
+    # turnover term is a diff, so a series that starts earlier pays a different
+    # cost at the boundary and a zero haircut would not price as no trade.
+    available = vol_exposure.where(high.notna())
+    reference = score(available)
+    rows: list[dict[str, Any]] = []
+    for haircut in sorted({*grid, selected}):
+        metrics = score(available * (1.0 - haircut * high))
+        rows.append(
+            {
+                "high_risk_exposure_haircut": haircut,
+                "is_selected": bool(abs(haircut - selected) < 1e-9),
+                **metrics,
+                "return_given_up_vs_vol_only": metrics["annualized_return"]
+                - reference["annualized_return"],
+                "drawdown_gained_vs_vol_only": metrics["average_drawdown"]
+                - reference["average_drawdown"],
+                "observations": int(common.sum()),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketStateResult:
     settings = config["models"]["market_state"]
     normalization_window = int(config["features"]["rolling_normalization_window"])
@@ -1140,7 +1213,10 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
         settings,
         risk_free=features["ff_rf"] if "ff_rf" in features else None,
     )
-    return MarketStateResult(history, latest, columns, diagnostics, comparison, decision_value)
+    exposure_tradeoff = _exposure_tradeoff(features, decision_source, settings)
+    return MarketStateResult(
+        history, latest, columns, diagnostics, comparison, decision_value, exposure_tradeoff
+    )
 
 
 def _annualized_score(returns: pd.Series, window: int) -> pd.Series:

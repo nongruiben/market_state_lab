@@ -218,6 +218,7 @@ def run_pipeline(
     state.diagnostics.to_csv(reports / "model_refit_diagnostics.csv", index=False)
     state.comparison.to_csv(reports / "model_comparison.csv", index=False)
     state.decision_value.to_csv(reports / "decision_value_comparison.csv", index=False)
+    state.exposure_tradeoff.to_csv(reports / "exposure_tradeoff.csv", index=False)
 
     if with_ibkr:
         symbols = [str(symbol) for symbol in config["ibkr"]["snapshot_symbols"]]
@@ -268,5 +269,6 @@ def run_pipeline(
         "model_comparison": reports / "model_comparison.csv",
         "model_diagnostics": reports / "model_refit_diagnostics.csv",
         "decision_value": reports / "decision_value_comparison.csv",
+        "exposure_tradeoff": reports / "exposure_tradeoff.csv",
         "feature_coverage": reports / "feature_coverage.csv",
     }

@@ -300,6 +300,33 @@ def test_decision_value_scores_drawdown_against_the_no_state_benchmark() -> None
     assert value.loc["vol_only", "maximum_drawdown"] > value.loc["buy_and_hold", "maximum_drawdown"]
 
 
+def test_exposure_tradeoff_publishes_the_whole_curve() -> None:
+    """The haircut is a preference dial, so the run must show the trade, not a number.
+
+    Every setting from 0.45 up beats vol_only on drawdown and the improvement is
+    monotone to the boundary, so no single value is "correct" - publishing only
+    the selected one would hide a choice the reader is entitled to make.
+    """
+    state, config = _configured_state()
+    curve = state.exposure_tradeoff
+    assert not curve.empty
+    selected = float(config["models"]["market_state"]["decision_evaluation"][
+        "high_risk_exposure_haircut"
+    ])
+    assert curve["is_selected"].sum() == 1
+    assert curve.loc[curve["is_selected"], "high_risk_exposure_haircut"].iloc[0] == pytest.approx(
+        selected
+    )
+    ordered = curve.sort_values("high_risk_exposure_haircut")
+    # A zero haircut is vol_only by construction, so it must price as no trade.
+    zero = ordered.loc[ordered["high_risk_exposure_haircut"].eq(0.0)]
+    if not zero.empty:
+        assert zero["return_given_up_vs_vol_only"].iloc[0] == pytest.approx(0.0, abs=1e-9)
+        assert zero["drawdown_gained_vs_vol_only"].iloc[0] == pytest.approx(0.0, abs=1e-9)
+    assert (ordered["average_drawdown"] <= 0).all()
+    assert (ordered["observations"] == ordered["observations"].iloc[0]).all()
+
+
 def test_calibration_softens_without_reordering_states() -> None:
     state, _ = _configured_state()
     history = state.history

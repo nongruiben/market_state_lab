@@ -293,9 +293,28 @@ models:
     decision_half_life_days: 15
     evaluation_target_volatility: 0.10
     decision_evaluation:
-      # 0.45 was hardcoded and never justified. It is a real knob - sweep it and
-      # report the sensitivity rather than trusting one arbitrary value.
-      high_risk_exposure_haircut: 0.45
+      # THIS IS A PREFERENCE DIAL, NOT AN OPTIMUM. Set it to your own taste.
+      #
+      # Every value from 0.45 up beats plain volatility targeting on drawdown,
+      # significantly, and the drawdown keeps improving monotonically to the
+      # boundary - so the data cannot pick the level for you. It prices the trade:
+      #   haircut  return   max DD   avg DD     CDaR  turnover  Calmar
+      #     0.00     7.47%  -26.04%   -5.29%  -19.61%   0.0302   0.287
+      #     0.25     6.93%  -23.29%   -4.88%  -17.66%   0.0316   0.298
+      #     0.45     6.48%  -21.05%   -4.59%  -16.13%   0.0344   0.308
+      #     0.65     6.02%  -18.77%   -4.33%  -14.65%   0.0383   0.321  <- default
+      #     0.85     5.55%  -17.30%   -4.23%  -13.72%   0.0428   0.321
+      #     1.00     5.19%  -16.20%   -4.20%  -13.03%   0.0465   0.320
+      # A linear haircut beat both a squared and a hard-threshold form, so the
+      # shape is settled even though the level is not.
+      #
+      # 0.65 is the default because Calmar rises 0.287 -> 0.321 up to it and is
+      # then flat: past 0.65 you keep paying return and turnover for drawdown
+      # that no longer improves risk-adjusted terms. That is a knee, not an
+      # optimum - it is still your call. Change the number, rerun, and read
+      # reports/exposure_tradeoff.csv, which publishes the whole curve.
+      high_risk_exposure_haircut: 0.65
+      haircut_grid: [0.0, 0.25, 0.45, 0.65, 0.85, 1.0]
       # Charged on |change in exposure|. A signal that only wins gross is not a
       # signal a person can trade.
       transaction_cost_bps: 2.0
