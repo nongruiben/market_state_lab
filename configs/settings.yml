@@ -132,11 +132,28 @@ features:
   # quantity after, which the rolling percentile then ranked against each other.
   # risk_credit stays out until an ICE-licensed FRED history is reachable; see
   # data.fred.prefer_api. Promote it here once hy_oas passes its coverage rule.
+  #
+  # risk_rates is out because it was making the forecast worse, not better. The
+  # yield curve is a 12-18 month recession indicator being asked about the next
+  # 20 sessions: through the 2022-23 inversion it read "high risk" for years
+  # while realised volatility was often calm. Dropping it from risk_score moves
+  # the calibrated forward Brier 0.6260 -> 0.5721 and nearly doubles the margin
+  # over climatology (-0.060 -> -0.114). Paired per-day, 21-day block bootstrap:
+  #   full  2000-2026  +0.0539  [+0.0345, +0.0742]  significant
+  #   first half -2013 +0.0709  [+0.0378, +0.1055]  significant
+  #   second half 2013 +0.0386  [+0.0168, +0.0602]  significant
+  # Both halves agree, which is the bar. Flipping the sign instead scored better
+  # on the full sample (+0.0691) but was a pre-2013 relic - +0.0026
+  # [-0.0433, +0.0482] after 2013 - and has no economic story, so it was rejected.
+  #
+  # The block is still computed and written to market_state_history.parquet, and
+  # the curve is still a GMM/HMM input. Removing it there too changed nothing
+  # (0.5721 either way). If the target ever moves to a multi-month horizon, this
+  # is the first block to reconsider - that is the horizon the curve speaks to.
   required_risk_blocks:
     - risk_volatility
     - risk_financial_conditions
     - risk_trend_breadth
-    - risk_rates
   use_revision_prone_french_history: false
   ofr_components:
     # Tested and rejected - kept switchable so nobody spends a day rediscovering

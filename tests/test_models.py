@@ -246,7 +246,7 @@ def test_calibrated_ensemble_retains_forward_skill() -> None:
 
     Every other test here checks plumbing, so a change that quietly pushed the
     forecast back below no-skill would leave the suite green. On the 26-year live
-    panel the calibrated ensemble scores 0.621 against climatology 0.686; on this
+    panel the calibrated ensemble scores 0.566 against climatology 0.686; on this
     synthetic bundle the margin is about -0.26. The floor below is deliberately
     loose - it exists to catch a collapse, not to pin a number.
     """
