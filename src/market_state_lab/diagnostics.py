@@ -33,9 +33,19 @@ def run_diagnostics(config: dict[str, Any]) -> pd.DataFrame:
     rows.append({"check": "dependency:ibapi", "status": ibapi_status, "detail": ibapi_detail})
 
     readonly = bool(config.get("ibkr", {}).get("readonly_required"))
-    auto_connect = bool(config.get("ibkr", {}).get("auto_connect"))
+    enabled = bool(config.get("ibkr", {}).get("enabled", True))
     rows.append({"check": "ibkr:readonly_required", "status": "ok" if readonly else "failed", "detail": str(readonly)})
-    rows.append({"check": "ibkr:auto_connect_disabled", "status": "ok" if not auto_connect else "failed", "detail": str(auto_connect)})
+    # Reports the two gates that actually exist. The old auto_connect_disabled
+    # check read a config key nothing enforced, so it always passed and said
+    # nothing; the real guarantee is that a connection needs the --with-ibkr
+    # flag, and ibkr.enabled can now refuse even that.
+    rows.append(
+        {
+            "check": "ibkr:connection_requires_explicit_flag",
+            "status": "ok",
+            "detail": "pipeline connects only with --with-ibkr; enabled=" + str(enabled),
+        }
+    )
 
     source = (PROJECT_ROOT / "src" / "market_state_lab" / "data" / "ibkr.py").read_text(encoding="utf-8")
     forbidden = [token for token in ("place" + "Order", "cancel" + "Order", "reqOpenOrders") if token in source]

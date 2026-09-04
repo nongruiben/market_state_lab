@@ -145,7 +145,7 @@
 .\.venv\Scripts\python.exe scripts\run_daily.py --with-ibkr
 ```
 
-TWS 必须保持 `Read-Only API`。项目不会自动连接 IBKR；历史行情还要求 `IBKR_ALLOW_HISTORICAL=1` 以及账户已有数据权限。
+TWS 必须保持 `Read-Only API`。**项目不会自动连接 IBKR**，唯一入口是 `--with-ibkr` 这个命令行参数；而且它取到的快照写在模型跑完之后，物理上无法影响任何模型输出。`ibkr.enabled: false` 现在是真正的总开关——`connect()` 第一步就会拒绝。（此前的 `auto_connect` 字段没有任何代码读取，已删除：它描述行为而不控制行为。）历史行情另需 `IBKR_ALLOW_HISTORICAL=1` 以及账户已有数据权限。
 
 ## 新闻流程
 
@@ -202,7 +202,8 @@ ALFRED 数据按首次公开可得日索引，不再额外套固定发布滞后�
 
 ## 主要输出
 
-- `reports/market_state_dashboard.html`：综合报告。
+- `reports/market_state_dashboard.html`：综合报告。约 690KB；`plotly.min.js` 只写一次放在同目录、跨运行复用（`reporting.plotly_mode`），因此仍可离线打开。
+- `reports/exposure_tradeoff.csv`：haircut 从 0 到 1 的完整权衡曲线，选定档位有标记。
 - `reports/latest_market_state.json`：原始概率、校准后概率、决策权重与其来源、模型权重、`risk_score_block_count`、`risk_percentile_expanding` 与 `vix_band`，以及 `forward_skill`（是否跑赢 climatology）。
 - `reports/market_state_history.parquet`：walk-forward 历史，含 `calibrated_p_*` 与 `calibration_temperature`。
 - `reports/model_comparison.csv`：`self_consistency_brier` 与 `forward_brier` 并列，含 climatology 行与配对技能差。

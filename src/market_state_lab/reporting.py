@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 import plotly.graph_objects as go
 import plotly.io as pio
+from plotly.offline import get_plotlyjs
 
 from market_state_lab.models import MarketStateResult, StyleResult
 
@@ -59,6 +60,18 @@ def write_dashboard(
     config: dict[str, Any],
 ) -> None:
     years = int(config["reporting"].get("history_years", 5))
+    # Inlining the library put a 4.8MB copy of plotly.js in every run's HTML.
+    # "directory" writes it once beside the dashboard and links it instead, which
+    # keeps offline viewing while dropping the page to about 50KB.
+    mode = str(config["reporting"].get("plotly_mode", "directory")).lower()
+    if mode == "directory":
+        path.parent.mkdir(parents=True, exist_ok=True)
+        (path.parent / "plotly.min.js").write_text(get_plotlyjs(), encoding="utf-8")
+        plotly_mode: bool | str = "directory"
+    elif mode == "cdn":
+        plotly_mode = "cdn"
+    else:
+        plotly_mode = True
     cutoff = state.history.index.max() - pd.DateOffset(years=years)
     state_history = state.history.loc[cutoff:]
     style_history = style.history.loc[cutoff:]
@@ -201,7 +214,7 @@ section h2 {{ font-size:16px; margin:0 0 12px; letter-spacing:0; }}
 </div>
 <section class="callout"><p>{decision_line}</p><p>{skill_line}</p></section>
 <div class="charts">
-  <section>{_figure_html(probability_figure, 'inline' if config['reporting'].get('inline_plotly', True) else 'cdn')}</section>
+  <section>{_figure_html(probability_figure, plotly_mode)}</section>
   <section>{_figure_html(risk_figure, False)}</section>
 </div>
 <section>{_figure_html(style_figure, False)}</section>

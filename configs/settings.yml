@@ -151,8 +151,12 @@ data:
       long_reversal: {required: false, max_age_business_days: 80, min_history_years: 15}
 
 ibkr:
+  # A real kill switch: connect() refuses when this is false. The pipeline never
+  # connects on its own in any case - that needs the --with-ibkr flag, and the
+  # snapshot it fetches is written after the model has already run, so it cannot
+  # reach any output. The old auto_connect key was removed: nothing read it, so
+  # it described behaviour instead of controlling it.
   enabled: true
-  auto_connect: false
   host: "127.0.0.1"
   port: 7496
   client_id: 91
@@ -397,4 +401,10 @@ news:
 
 reporting:
   history_years: 5
-  inline_plotly: true
+  # directory | inline | cdn. "directory" writes plotly.min.js once next to the
+  # dashboard and links it, taking the page from 4.8MB to 690KB while still
+  # opening offline. The remaining 690KB is chart data, not library: three
+  # figures of daily series over reporting.history_years, so lowering that is
+  # the only further lever. "inline" embeds the library in every run's HTML;
+  # "cdn" is smallest but will not render without a network connection.
+  plotly_mode: directory

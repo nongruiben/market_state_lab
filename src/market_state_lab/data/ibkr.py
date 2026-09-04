@@ -45,6 +45,7 @@ class IBKRConnectionSettings:
     timeout_seconds: int
     market_data_type: int
     readonly_required: bool
+    enabled: bool
 
 
 def installed_ibapi_version() -> str | None:
@@ -134,6 +135,7 @@ class ReadOnlyIBKRClient:
             timeout_seconds=int(section.get("timeout_seconds", 12)),
             market_data_type=int(section.get("market_data_type", 4)),
             readonly_required=bool(section.get("readonly_required", True)),
+            enabled=bool(section.get("enabled", True)),
         )
         if self.settings.market_data_type not in {1, 2, 3, 4}:
             raise ValueError("ibkr.market_data_type must be one of 1, 2, 3, or 4")
@@ -157,6 +159,12 @@ class ReadOnlyIBKRClient:
         return contract
 
     def connect(self) -> None:
+        # First gate, ahead of everything including the SDK probe: if the operator
+        # switched IBKR off, the honest answer is "refusing", not "SDK missing".
+        # ibkr.enabled used to be decorative - nothing read it, so setting it to
+        # false changed nothing at all.
+        if not self.settings.enabled:
+            raise RuntimeError("Configuration has ibkr.enabled=false; refusing to connect")
         if EClient is None:
             raise RuntimeError(
                 "IBKR's official Python API is not installed; run install_ibkr_api.ps1 "
