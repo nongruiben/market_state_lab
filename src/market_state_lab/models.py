@@ -777,6 +777,14 @@ def _bootstrap_sharpe_interval(
     return float(np.percentile(finite, 2.5)), float(np.percentile(finite, 97.5))
 
 
+def _smooth_probabilities(frame: pd.DataFrame, half_life: float) -> pd.DataFrame:
+    """The same EWM the decision layer applies, so evaluation matches advice."""
+    if half_life <= 0:
+        return frame
+    smoothed = frame.ewm(halflife=half_life, adjust=False).mean()
+    return smoothed.div(smoothed.sum(axis=1), axis=0)
+
+
 def _drawdown_depth(returns: np.ndarray) -> tuple[float, float, float]:
     """Worst, average and conditional (worst 5%) drawdown depth of one path."""
     wealth = np.cumprod(1.0 + returns)
@@ -854,7 +862,20 @@ def _decision_value(
     block = int(evaluation.get("bootstrap_block_days", 21))
     seed = int(evaluation.get("bootstrap_seed", 42))
 
-    vol_exposure = (target_volatility / features["volatility_20"]).clip(0.0, 1.5)
+    # Default cap is 1.0: no leverage. Lifting it to 1.5 buys 0.25 points of
+    # annual return, gives back some drawdown, and requires a margin account and
+    # the willingness to run 1.36x on the calmest 19% of days. A backtest should
+    # not quietly assume a position its reader cannot take.
+    cap = float(evaluation.get("exposure_cap", 1.0))
+    # The report tells the reader to act on the smoothed decision weights, so the
+    # smoothed weights are what gets backtested. Scoring the raw probabilities
+    # while advising the smoothed ones measures a strategy nobody is running.
+    half_life = float(settings.get("decision_half_life_days", 15))
+    probabilities = {
+        name: _smooth_probabilities(frame, half_life) for name, frame in probabilities.items()
+    }
+
+    vol_exposure = (target_volatility / features["volatility_20"]).clip(0.0, cap)
     common = features[["market_return", "volatility_20"]].notna().all(axis=1)
     for frame in probabilities.values():
         common &= frame.notna().all(axis=1)
@@ -974,7 +995,8 @@ def _exposure_tradeoff(
     selected = float(evaluation.get("high_risk_exposure_haircut", 0.45))
     grid = [float(value) for value in evaluation.get("haircut_grid", [0.0, 0.25, 0.45, 0.65, 0.85, 1.0])]
 
-    vol_exposure = (target_volatility / features["volatility_20"]).clip(0.0, 1.5)
+    cap = float(evaluation.get("exposure_cap", 1.0))
+    vol_exposure = (target_volatility / features["volatility_20"]).clip(0.0, cap)
     high = decision_probabilities["p_high_risk"]
     common = (
         features["market_return"].notna()
@@ -1213,7 +1235,7 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
         settings,
         risk_free=features["ff_rf"] if "ff_rf" in features else None,
     )
-    exposure_tradeoff = _exposure_tradeoff(features, decision_source, settings)
+    exposure_tradeoff = _exposure_tradeoff(features, decision, settings)
     return MarketStateResult(
         history, latest, columns, diagnostics, comparison, decision_value, exposure_tradeoff
     )

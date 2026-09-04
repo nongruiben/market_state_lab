@@ -299,22 +299,28 @@ models:
       # significantly, and the drawdown keeps improving monotonically to the
       # boundary - so the data cannot pick the level for you. It prices the trade:
       #   haircut  return   max DD   avg DD     CDaR  turnover  Calmar
-      #     0.00     7.47%  -26.04%   -5.29%  -19.61%   0.0302   0.287
-      #     0.25     6.93%  -23.29%   -4.88%  -17.66%   0.0316   0.298
-      #     0.45     6.48%  -21.05%   -4.59%  -16.13%   0.0344   0.308
-      #     0.65     6.02%  -18.77%   -4.33%  -14.65%   0.0383   0.321  <- default
-      #     0.85     5.55%  -17.30%   -4.23%  -13.72%   0.0428   0.321
-      #     1.00     5.19%  -16.20%   -4.20%  -13.03%   0.0465   0.320
+      #     0.00     7.24%  -25.74%   -4.81%  -19.38%   0.0170   0.281
+      #     0.25     6.71%  -22.54%   -4.35%  -17.26%   0.0159   0.298
+      #     0.45     6.29%  -19.91%   -4.02%  -15.66%   0.0150   0.316
+      #     0.65     5.86%  -17.74%   -3.72%  -14.31%   0.0142   0.330  <- default
+      #     0.85     5.42%  -16.91%   -3.46%  -13.24%   0.0134   0.321
+      #     1.00     5.09%  -16.28%   -3.29%  -12.53%   0.0128   0.313
       # A linear haircut beat both a squared and a hard-threshold form, so the
       # shape is settled even though the level is not.
       #
-      # 0.65 is the default because Calmar rises 0.287 -> 0.321 up to it and is
-      # then flat: past 0.65 you keep paying return and turnover for drawdown
-      # that no longer improves risk-adjusted terms. That is a knee, not an
-      # optimum - it is still your call. Change the number, rerun, and read
-      # reports/exposure_tradeoff.csv, which publishes the whole curve.
+      # 0.65 is the default because Calmar peaks there - 0.281 up to 0.330, then
+      # back down to 0.313. That is an interior maximum, not a knee, so unlike the
+      # drawdown column it does pick a level. It is still only one criterion: if
+      # you care about drawdown alone, keep going to 1.00. Change the number,
+      # rerun, and read reports/exposure_tradeoff.csv for the whole curve.
       high_risk_exposure_haircut: 0.65
       haircut_grid: [0.0, 0.25, 0.45, 0.65, 0.85, 1.0]
+      # Maximum position. 1.0 means never borrow. Volatility targeting wants
+      # 1.36x on the calmest days and would run above 1.0 on 19% of the sample;
+      # capping at 1.0 costs 0.25 points of annual return and slightly IMPROVES
+      # drawdown, so the leverage was never doing much work. Raise to 1.5 only
+      # if a margin account is genuinely part of how this gets executed.
+      exposure_cap: 1.0
       # Charged on |change in exposure|. A signal that only wins gross is not a
       # signal a person can trade.
       transaction_cost_bps: 2.0
