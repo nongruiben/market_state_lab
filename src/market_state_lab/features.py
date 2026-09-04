@@ -163,6 +163,16 @@ def build_features(
             market[column] = source[column]
     if "vix_close" in market:
         market["vix_change_21"] = market["vix_close"].pct_change(21, fill_method=None)
+    # Term structure, not levels. VIX above VIX3M is backwardation - the market
+    # pricing near-term stress above longer-dated - and that is the classic
+    # regime signal; the raw levels would just restate vix_close.
+    if {"vix_close", "vix3m"}.issubset(source.columns):
+        market["vix_term_slope"] = source["vix_close"] / source["vix3m"].replace(0, np.nan)
+    if {"vix9d", "vix_close"}.issubset(source.columns):
+        market["vix_short_slope"] = source["vix9d"] / source["vix_close"].replace(0, np.nan)
+    for column in ("skew", "vvix"):
+        if column in source:
+            market[column] = source[column]
     if {"ret_hyg", "ret_lqd"}.issubset(source.columns):
         market["credit_risk_return_21"] = _rolling_compound(
             source["ret_hyg"] - source["ret_lqd"], 21

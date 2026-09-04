@@ -39,6 +39,35 @@ data:
   cboe:
     enabled: true
     vix_url: "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
+    # Tested and rejected. Left here, disabled, so the experiment is one uncomment
+    # away and does not get re-run from scratch. Empty means zero extra requests.
+    #
+    # The motivation was good: SKEW prices the implied left tail, which is where
+    # this model's information lives, and it reaches back to 1990. The data did
+    # not agree. SKEW correlates +0.188 with the worst day of the next 20 - the
+    # wrong sign - because it rises in calm markets when tail hedges are cheap
+    # and falls in a real crash as the whole surface shifts.
+    #
+    # As model features (only reaches the ~10% of ensemble weight held by
+    # GMM/HMM, so underpowered by construction), against Brier 0.5721:
+    #   + skew            0.5715  +0.0006  [-0.0009, +0.0021]  ns
+    #   + vix_term_slope  0.5714  +0.0006  [-0.0010, +0.0024]  ns
+    #   + vvix            0.5727  -0.0006  [-0.0028, +0.0016]  ns
+    #   + all four        0.5724  -0.0003  [-0.0024, +0.0017]  ns
+    # Inside risk_score, where 90% of the weight is and the test has real power:
+    #   skew negated      0.5768  -0.0047  [-0.0088, -0.0006]  significant LOSS
+    #   skew positive     0.5749  -0.0028  [-0.0073, +0.0017]  ns, also negative
+    # Average drawdown was unchanged in every variant. Both signs, both yardsticks.
+    #
+    # If re-enabled: vix3m/vix9d start in 2009/2011, so they may be model features
+    # but must never enter risk_score - that would reintroduce the composition
+    # drift required_risk_blocks exists to prevent.
+    indices: {}
+    # indices:
+    #   skew: "https://cdn.cboe.com/api/global/us_indices/daily_prices/SKEW_History.csv"
+    #   vix3m: "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv"
+    #   vix9d: "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX9D_History.csv"
+    #   vvix: "https://cdn.cboe.com/api/global/us_indices/daily_prices/VVIX_History.csv"
 
   ofr:
     enabled: true

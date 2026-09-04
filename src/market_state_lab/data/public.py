@@ -191,6 +191,36 @@ class PublicDataLoader:
             self._record("vix", "CBOE", None, "failed", str(exc))
             return pd.DataFrame()
 
+    def _cboe_indices(self) -> pd.DataFrame:
+        """Other CBOE volatility indices, same feed and licence as the VIX.
+
+        SKEW is the one that matters here: it prices the implied left tail, which
+        is where this model's information actually lives. It also has history back
+        to 1990, unlike VIX9D (2011) and VIX3M (2009), so only SKEW is deep enough
+        to sit inside risk_score without reintroducing composition drift.
+        """
+        section = self.config["data"].get("cboe", {})
+        frames: list[pd.Series] = []
+        for name, url in (section.get("indices", {}) or {}).items():
+            try:
+                result = self.client.get(url, f"cboe_{name}.csv")
+                raw = pd.read_csv(io.BytesIO(result.content))
+                raw.columns = [str(column).strip().lower() for column in raw.columns]
+                date_column = next(column for column in raw.columns if "date" in column)
+                close_column = next(
+                    (column for column in raw.columns if "close" in column),
+                    raw.columns[-1],
+                )
+                series = pd.to_numeric(raw[close_column], errors="coerce")
+                series.index = pd.to_datetime(raw[date_column], errors="coerce")
+                series.name = str(name)
+                frame = self._clean_index(series.to_frame()).loc[self.start_date :].dropna()
+                frames.append(frame[str(name)])
+                self._record(str(name), "CBOE", frame, result.status)
+            except Exception as exc:
+                self._record(str(name), "CBOE", None, "failed", str(exc))
+        return pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
+
     def _ofr(self) -> pd.DataFrame:
         url = self.config["data"]["ofr"]["fsi_url"]
         try:
@@ -415,6 +445,10 @@ class PublicDataLoader:
         data = self.config["data"]
         macro = self._fred() if data.get("fred", {}).get("enabled", True) else pd.DataFrame()
         vix = self._vix() if data.get("cboe", {}).get("enabled", True) else pd.DataFrame()
+        if not vix.empty and data.get("cboe", {}).get("indices"):
+            extra = self._cboe_indices()
+            if not extra.empty:
+                vix = vix.join(extra, how="outer").sort_index()
         ofr = self._ofr() if data.get("ofr", {}).get("enabled", True) else pd.DataFrame()
         french = self._french() if data.get("french", {}).get("enabled", True) else pd.DataFrame()
         symbols = data.get("nasdaq", {}).get("symbols", {})

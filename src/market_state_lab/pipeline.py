@@ -67,7 +67,15 @@ def _feature_coverage(features: pd.DataFrame, config: dict[str, Any]) -> pd.Data
 def _eligible_bundle(bundle: PublicDataBundle, manifest: pd.DataFrame) -> PublicDataBundle:
     eligible = eligible_datasets(manifest)
     macro = bundle.macro[[column for column in bundle.macro if column in eligible]]
-    vix = bundle.vix if "vix" in eligible else pd.DataFrame()
+    # The extra CBOE indices ride inside bundle.vix but are separate manifest
+    # datasets, so gating the whole frame on the "vix" row alone would let a
+    # source that failed its own health check in through the side door.
+    if "vix" in eligible:
+        vix_columns = [column for column in bundle.vix if str(column).startswith("vix_")]
+        vix_columns.extend(column for column in bundle.vix if str(column) in eligible)
+        vix = bundle.vix[list(dict.fromkeys(vix_columns))]
+    else:
+        vix = pd.DataFrame()
     ofr = bundle.ofr if "financial_stress_index" in eligible else pd.DataFrame()
     french_columns: list[str] = []
     if "ff5" in eligible:
