@@ -66,7 +66,10 @@ def write_dashboard(
     mode = str(config["reporting"].get("plotly_mode", "directory")).lower()
     if mode == "directory":
         path.parent.mkdir(parents=True, exist_ok=True)
-        (path.parent / "plotly.min.js").write_text(get_plotlyjs(), encoding="utf-8")
+        library = path.parent / "plotly.min.js"
+        payload = get_plotlyjs()
+        if not library.exists() or library.stat().st_size != len(payload.encode("utf-8")):
+            library.write_text(payload, encoding="utf-8")
         plotly_mode: bool | str = "directory"
     elif mode == "cdn":
         plotly_mode = "cdn"
@@ -132,12 +135,24 @@ def write_dashboard(
     decision_weights = latest.get("decision_weights", {}) or {}
     if decision_weights:
         leading = max(decision_weights, key=lambda name: decision_weights[name])
+        haircut = float(
+            (config["models"]["market_state"].get("decision_evaluation", {}) or {}).get(
+                "high_risk_exposure_haircut", 0.0
+            )
+        )
+        sizing = (
+            "The recommended position is plain volatility targeting; the state below sizes "
+            "nothing, because it has no measured value over a persistence rule."
+            if haircut == 0.0
+            else f"Position size applies a {haircut:.0%} haircut at full high-risk conviction "
+            f"(models.market_state.decision_evaluation.high_risk_exposure_haircut)."
+        )
         decision_line = (
-            f"Act on the decision weights: <strong>{html.escape(leading.replace('_', ' '))}</strong> "
-            f"at {decision_weights[leading]:.1%}, from the {html.escape(decision_source)} "
-            f"probabilities smoothed with a {half_life:g}-day half-life. The headline state above is "
-            f"the unsmoothed read and will lead the decision weights by roughly {half_life:g} "
-            f"trading days at a turn - when the two disagree, that lag is the reason."
+            f"{sizing} Leading state: <strong>"
+            f"{html.escape(leading.replace('_', ' '))}</strong> at "
+            f"{decision_weights[leading]:.1%}, from the {html.escape(decision_source)} "
+            f"probabilities smoothed with a {half_life:g}-day half-life - an observation, "
+            f"not an instruction."
         )
     else:
         decision_line = "No decision weights were produced for this run."
@@ -156,14 +171,16 @@ def write_dashboard(
 
     skill = latest.get("forward_skill", {}) or {}
     if skill:
-        verdict = "beats" if skill.get("beats_climatology") else "does NOT beat"
+        verdict = "beats" if skill.get("beats_persistence") else "does NOT beat"
         skill_line = (
-            f"Forward skill: the calibrated ensemble {verdict} the no-skill climatology on "
-            f"{html.escape(str(skill.get('target', '')))} - Brier "
+            f"Forward skill: the calibrated ensemble <strong>{verdict}</strong> a plain "
+            f"persistence rule on {html.escape(str(skill.get('target', '')))} - Brier "
             f"{float(skill.get('forward_brier', float('nan'))):.3f} against "
-            f"{float(skill.get('climatology_brier', float('nan'))):.3f} over "
-            f"{int(skill.get('observations', 0)):,} paired days. The self-consistency Brier in the "
-            f"table below is not accuracy; it only measures agreement with the percentile rule."
+            f"{float(skill.get('persistence_brier', float('nan'))):.3f} for persistence and "
+            f"{float(skill.get('climatology_brier', float('nan'))):.3f} for the trailing base "
+            f"rate, over {int(skill.get('observations', 0)):,} common days. Persistence is the "
+            f"bar that matters for a volatility target, because volatility clusters. The "
+            f"self-consistency Brier in the table below is not accuracy at all."
         )
     else:
         skill_line = "Forward skill was not evaluated for this run."

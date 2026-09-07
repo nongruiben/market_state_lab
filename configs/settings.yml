@@ -20,24 +20,16 @@ data:
   fred:
     enabled: true
     vintage_mode: latest  # set point_in_time and FRED_API_KEY for ALFRED initial releases
-    # The public graph CSV endpoint serves only a rolling ~3-year window for the
-    # licensed ICE BofA spread series (hy_oas, ig_oas) while returning full history
-    # for the others, and no cosd/coed combination lifts it. With a free
-    # FRED_API_KEY the official observations endpoint returns the whole series.
-    # Without one, those two sources now fail their coverage rule loudly instead of
-    # silently dropping out of the model.
+    # Keyless graph CSV truncates the ICE-licensed series (hy_oas, ig_oas) to a
+    # rolling ~3 years; no cosd/coed lifts it. A free FRED_API_KEY returns full
+    # history. Moody's (baa/aaa) is not licensed that way and needs no key.
     prefer_api: true
     api_base_url: "https://api.stlouisfed.org/fred/series/observations"
     series:
-      # ICE BofA OAS. Licensed, so the keyless graph CSV caps them at a rolling
-      # ~3 years and they fail their coverage rule. Kept so a FRED_API_KEY would
-      # light them up, but the credit block no longer depends on them.
+      # Licensed; truncated without a key. Not required by any block.
       hy_oas: BAMLH0A0HYM2
       ig_oas: BAMLC0A0CM
-      # Moody's is not licensed the same way and comes back complete without a
-      # key: baa_spread 10,610 rows from 1986, aaa_spread 11,393 from 1983 -
-      # longer than the ICE series would give even with one. Baa minus the 10y
-      # Treasury is the classic default spread of the asset-pricing literature.
+      # Moody's default spread - complete history, no key needed.
       baa_spread: BAA10Y
       aaa_spread: AAA10Y
       yield_curve_10y2y: T10Y2Y
@@ -48,35 +40,10 @@ data:
   cboe:
     enabled: true
     vix_url: "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"
-    # Tested and rejected. Left here, disabled, so the experiment is one uncomment
-    # away and does not get re-run from scratch. Empty means zero extra requests.
-    #
-    # The motivation was good: SKEW prices the implied left tail, which is where
-    # this model's information lives, and it reaches back to 1990. The data did
-    # not agree. SKEW correlates +0.188 with the worst day of the next 20 - the
-    # wrong sign - because it rises in calm markets when tail hedges are cheap
-    # and falls in a real crash as the whole surface shifts.
-    #
-    # As model features (only reaches the ~10% of ensemble weight held by
-    # GMM/HMM, so underpowered by construction), against Brier 0.5721:
-    #   + skew            0.5715  +0.0006  [-0.0009, +0.0021]  ns
-    #   + vix_term_slope  0.5714  +0.0006  [-0.0010, +0.0024]  ns
-    #   + vvix            0.5727  -0.0006  [-0.0028, +0.0016]  ns
-    #   + all four        0.5724  -0.0003  [-0.0024, +0.0017]  ns
-    # Inside risk_score, where 90% of the weight is and the test has real power:
-    #   skew negated      0.5768  -0.0047  [-0.0088, -0.0006]  significant LOSS
-    #   skew positive     0.5749  -0.0028  [-0.0073, +0.0017]  ns, also negative
-    # Average drawdown was unchanged in every variant. Both signs, both yardsticks.
-    #
-    # If re-enabled: vix3m/vix9d start in 2009/2011, so they may be model features
-    # but must never enter risk_score - that would reintroduce the composition
-    # drift required_risk_blocks exists to prevent.
+    # Tested and rejected: SKEW correlates +0.188 with the worst coming day
+    # (wrong sign) and inside risk_score it was a significant loss; VIX3M/VIX9D/
+    # VVIX added nothing. Empty means zero extra requests.
     indices: {}
-    # indices:
-    #   skew: "https://cdn.cboe.com/api/global/us_indices/daily_prices/SKEW_History.csv"
-    #   vix3m: "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv"
-    #   vix9d: "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX9D_History.csv"
-    #   vvix: "https://cdn.cboe.com/api/global/us_indices/daily_prices/VVIX_History.csv"
 
   ofr:
     enabled: true
@@ -135,14 +102,19 @@ data:
     default_min_observation_density: 0
     rules:
       vix: {required: true, max_age_business_days: 3, min_history_years: 15, min_observation_density: 0.9}
-      spy: {required: true, max_age_business_days: 3, min_history_years: 15, min_observation_density: 0.9}
+      # 10, not 15: the Nasdaq fallback only serves 10 years, so demanding more
+      # turned a Yahoo outage into a hard abort of the whole run.
+      spy: {required: true, max_age_business_days: 3, min_history_years: 10, min_observation_density: 0.9}
       hy_oas: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
       baa_spread: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
       aaa_spread: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
       ig_oas: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
       yield_curve_10y2y: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
       yield_curve_10y3m: {required: false, max_age_business_days: 5, min_history_years: 15, min_observation_density: 0.9}
-      financial_conditions: {required: false, max_age_business_days: 10, min_history_years: 15}
+      # required: risk_financial_conditions is a required block, so treating its
+      # only inputs as optional let a survivable outage produce an all-NaN
+      # risk_score and kill the run with an opaque message.
+      financial_conditions: {required: true, max_age_business_days: 10, min_history_years: 15}
       fed_stress: {required: false, max_age_business_days: 10, min_history_years: 15}
       financial_stress_index: {required: false, max_age_business_days: 7, min_history_years: 15}
       ff5: {required: false, max_age_business_days: 80, min_history_years: 15}
@@ -171,61 +143,20 @@ features:
   momentum_windows: [21, 63, 252]
   style_windows: [21, 63, 126]
   rolling_normalization_window: 756
-  # risk_score is the mean of exactly these blocks, always. Averaging "whatever is
-  # available" made it a 4-block quantity before HYG history starts and a 5-block
-  # quantity after, which the rolling percentile then ranked against each other.
-  # risk_credit stays out, but no longer for lack of data. Moody's BAA10Y and
-  # AAA10Y gave the block 97.3% coverage from 2000 without any API key, and it
-  # still does not help: promoting it moves the calibrated forward Brier
-  # 0.5721 -> 0.5821, CI [-0.0227, +0.0017] - not significant but negative in
-  # both halves (-0.0117 / -0.0084), with average drawdown unchanged. As model
-  # features instead: -0.0008, also nothing.
-  #
-  # Same diagnosis as risk_rates. Credit spreads are a quarters-to-years default
-  # cycle variable being asked about the next 20 sessions, and the near-term
-  # stress they would signal is already in the volatility block. Reconsider both
-  # together if the target ever moves to a multi-month horizon.
-  #
-  # risk_rates is out because it was making the forecast worse, not better. The
-  # yield curve is a 12-18 month recession indicator being asked about the next
-  # 20 sessions: through the 2022-23 inversion it read "high risk" for years
-  # while realised volatility was often calm. Dropping it from risk_score moves
-  # the calibrated forward Brier 0.6260 -> 0.5721 and nearly doubles the margin
-  # over climatology (-0.060 -> -0.114). Paired per-day, 21-day block bootstrap:
-  #   full  2000-2026  +0.0539  [+0.0345, +0.0742]  significant
-  #   first half -2013 +0.0709  [+0.0378, +0.1055]  significant
-  #   second half 2013 +0.0386  [+0.0168, +0.0602]  significant
-  # Both halves agree, which is the bar. Flipping the sign instead scored better
-  # on the full sample (+0.0691) but was a pre-2013 relic - +0.0026
-  # [-0.0433, +0.0482] after 2013 - and has no economic story, so it was rejected.
-  #
-  # The block is still computed and written to market_state_history.parquet, and
-  # the curve is still a GMM/HMM input. Removing it there too changed nothing
-  # (0.5721 either way). If the target ever moves to a multi-month horizon, this
-  # is the first block to reconsider - that is the horizon the curve speaks to.
+  # risk_score is the mean of exactly these blocks, always - averaging whatever
+  # happened to be available made it a different quantity before and after HYG
+  # history starts, which the rolling percentile then ranked against itself.
+  # risk_rates is out: its sign is reversed at every horizon tested (rank corr
+  # +0.25 to +0.35 with forward drawdown), so it was fighting the data.
+  # risk_credit is out: no help at 20 days, and its 126-day edge is pre-2013 only.
   required_risk_blocks:
     - risk_volatility
     - risk_financial_conditions
     - risk_trend_breadth
   use_revision_prone_french_history: false
   ofr_components:
-    # Tested and rejected - kept switchable so nobody spends a day rediscovering
-    # this. The OFR feed ships the headline stress index plus eight sub-indices,
-    # all at 100% coverage, and only the headline was ever used. It looked like
-    # free macro breadth. It is not: the five category components sum to the
-    # headline exactly (corr 1.0000) and so do the three regional ones, so they
-    # are two redundant decompositions of one number rather than new information.
-    #
-    # Calibrated forward Brier against the headline-only reference (0.6260),
-    # paired per-day, 21-day block bootstrap:
-    #   categories -> risk block      0.6263  -0.0003  [-0.0032, +0.0026]  ns
-    #   categories -> model features  0.6265  -0.0005  [-0.0039, +0.0032]  ns
-    #   categories -> both            0.6276  -0.0016  [-0.0051, +0.0019]  ns
-    #   all 8 + headline -> both      0.6202  +0.0058  [+0.0017, +0.0098]  sig
-    # The only significant variant is the one with the worst justification, and
-    # it fails the two-window rule: +0.0112 [+0.0053, +0.0173] before 2013 and
-    # +0.0009 [-0.0045, +0.0063] after. The effect is a pre-2013 relic.
-    #
+    # Tested and rejected: the 5 category and 3 regional components each sum to
+    # the headline exactly (corr 1.0000) - one number decomposed twice.
     # headline | categories | all
     in_risk_block: headline
     in_model_features: headline
@@ -237,11 +168,9 @@ features:
     vix_levels: [15, 25, 40]
     vix_labels: [calm, normal, stressed, crisis]
   coverage:
-    # Written to reports/feature_coverage.csv every run. `required: true` fails the
-    # run outright; `required: false` still reports below_threshold so a silently
-    # missing input is visible instead of just quietly leaving the model.
-    # Thresholds are set to pass on both the 26-year live panel and the shorter
-    # offline fixture, whose long-window features are structurally thinner.
+    # reports/feature_coverage.csv every run. required: true fails the run;
+    # required: false still reports below_threshold. Rules are evaluated even
+    # when the feature is missing entirely.
     default_min_coverage: 0.0
     rules:
       market_return: {required: true, min_coverage: 0.95}
@@ -255,6 +184,9 @@ features:
       vix_close: {required: true, min_coverage: 0.95}
       macro_yield_curve_10y2y: {required: true, min_coverage: 0.95}
       macro_financial_conditions: {required: true, min_coverage: 0.95}
+      # A GMM/HMM input at ~10% ensemble weight: reported, not load-bearing.
+      macro_baa_spread: {required: false, min_coverage: 0.90}
+      credit_quality_spread: {required: false, min_coverage: 0.90}
       # Reported, not enforced: the keyless FRED path cannot deliver these.
       macro_hy_oas: {required: false, min_coverage: 0.90}
       macro_ig_oas: {required: false, min_coverage: 0.90}
@@ -271,36 +203,8 @@ models:
     reg_covar: 0.0001
     minimum_component_effective_observations: 25
     feature_reduction:
-      # Opt-in, and deliberately OFF by default. Read this before flipping it.
-      #
-      # The regime features are collinear (volatility_20, volatility_60, vix_close
-      # and downside_volatility_60 are one factor). A diagonal covariance treats
-      # that redundancy as independent evidence and multiplies it, which is why
-      # posteriors saturate to 0/1 on most days. Projecting onto orthogonal
-      # components first fixes that, and PCA is refit per training slice.
-      #
-      # Measured on the 26-year live panel (GMM saturated-share / forward Brier):
-      #   none     0.778/1.003
-      #   n=2 diag 0.108/0.825   n=3 diag 0.114/0.863   n=4 diag 0.123/0.917
-      #   n=3 full 0.252/0.932   n=5 full 0.323/0.918
-      # covariance_type: full makes saturation worse, not better; PCA plus diag is
-      # the pairing that works, and n=2 wins on both axes.
-      #
-      # But it does NOT improve the number that matters: the calibrated ensemble
-      # sits at 0.621 with PCA and 0.620 without, because the dynamic weights give
-      # GMM/HMM only ~10% either way. And on the synthetic fixture it is clearly
-      # worse (regime recall 0.457 -> 0.358), because that generator draws each
-      # feature independently given the regime - exactly the assumption diag-GMM
-      # makes and exactly what real markets violate. So the fixture rewards
-      # over-counting redundant evidence and real data punishes it.
-      #
-      # Left off because it costs regime recall and buys nothing on the headline
-      # metric. The degeneracy it would fix is now reported instead: see the
-      # degenerate / saturated_share columns in model_refit_diagnostics.csv.
-      #
-      # Note the models themselves are worth keeping even though each one loses
-      # to climatology alone: zeroing their weights costs +0.0175 forward Brier,
-      # bootstrap CI [+0.0090, +0.0266], which is 27% of the skill margin.
+      # Off by default. PCA cuts GMM posterior saturation 0.78 -> 0.11 but does
+      # not move the calibrated ensemble and costs synthetic regime recall.
       method: none
       n_components: 2
       whiten: true
@@ -317,33 +221,15 @@ models:
     decision_half_life_days: 15
     evaluation_target_volatility: 0.10
     decision_evaluation:
-      # THIS IS A PREFERENCE DIAL, NOT AN OPTIMUM. Set it to your own taste.
-      #
-      # Every value from 0.45 up beats plain volatility targeting on drawdown,
-      # significantly, and the drawdown keeps improving monotonically to the
-      # boundary - so the data cannot pick the level for you. It prices the trade:
-      #   haircut  return   max DD   avg DD     CDaR  turnover  Calmar
-      #     0.00     7.24%  -25.74%   -4.81%  -19.38%   0.0170   0.281
-      #     0.25     6.71%  -22.54%   -4.35%  -17.26%   0.0159   0.298
-      #     0.45     6.29%  -19.91%   -4.02%  -15.66%   0.0150   0.316
-      #     0.65     5.86%  -17.74%   -3.72%  -14.31%   0.0142   0.330  <- default
-      #     0.85     5.42%  -16.91%   -3.46%  -13.24%   0.0134   0.321
-      #     1.00     5.09%  -16.28%   -3.29%  -12.53%   0.0128   0.313
-      # A linear haircut beat both a squared and a hard-threshold form, so the
-      # shape is settled even though the level is not.
-      #
-      # 0.65 is the default because Calmar peaks there - 0.281 up to 0.330, then
-      # back down to 0.313. That is an interior maximum, not a knee, so unlike the
-      # drawdown column it does pick a level. It is still only one criterion: if
-      # you care about drawdown alone, keep going to 1.00. Change the number,
-      # rerun, and read reports/exposure_tradeoff.csv for the whole curve.
-      high_risk_exposure_haircut: 0.65
+      # 0.0 = the recommended position is plain volatility targeting; the regime
+      # state sizes nothing. It has no measured value - it loses to a persistence
+      # rule on forecasting, and against an exposure-matched control its drawdown
+      # edge is insignificant at every haircut, so the apparent win was
+      # de-leveraging. reports/exposure_tradeoff.csv prices the alternatives.
+      high_risk_exposure_haircut: 0.0
       haircut_grid: [0.0, 0.25, 0.45, 0.65, 0.85, 1.0]
-      # Maximum position. 1.0 means never borrow. Volatility targeting wants
-      # 1.36x on the calmest days and would run above 1.0 on 19% of the sample;
-      # capping at 1.0 costs 0.25 points of annual return and slightly IMPROVES
-      # drawdown, so the leverage was never doing much work. Raise to 1.5 only
-      # if a margin account is genuinely part of how this gets executed.
+      # 1.0 = never borrow. Lifting to 1.5 buys 0.25pp of annual return and needs
+      # a margin account on the calmest 19% of days.
       exposure_cap: 1.0
       # Charged on |change in exposure|. A signal that only wins gross is not a
       # signal a person can trade.
@@ -360,9 +246,8 @@ models:
       forward_window: 756
       forward_min_observations: 252
     calibration:
-      # The raw states beat climatology on hit rate but lose on Brier, i.e. they
-      # are informative and overconfident. One temperature per refit is the least
-      # overfit-prone fix for that, and it cannot reorder the states.
+      # Walk-forward temperature scaling on settled outcomes. Monotone, so it
+      # cannot reorder states. Narrows the gap to climatology, not to persistence.
       enabled: true
       method: temperature
       window: 1260

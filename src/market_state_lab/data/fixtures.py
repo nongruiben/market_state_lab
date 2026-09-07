@@ -18,6 +18,8 @@ def load_offline_fixture(config: dict[str, Any]) -> PublicDataBundle:
     macro_columns = (
         "hy_oas",
         "ig_oas",
+        "baa_spread",
+        "aaa_spread",
         "yield_curve_10y2y",
         "yield_curve_10y3m",
         "financial_conditions",

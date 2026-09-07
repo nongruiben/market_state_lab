@@ -36,6 +36,10 @@ def main() -> None:
     frame["vix_close"] = 13 + regime * 10 + rng.normal(0, 1, len(dates))
     frame["hy_oas"] = 3 + regime * 1.8 + rng.normal(0, 0.15, len(dates))
     frame["ig_oas"] = 0.9 + regime * 0.45 + rng.normal(0, 0.04, len(dates))
+    # Moody's spreads: the live model uses these, so the fixture must too, or
+    # offline exercises a different feature set than production.
+    frame["baa_spread"] = 2.2 + regime * 1.1 + rng.normal(0, 0.10, len(dates))
+    frame["aaa_spread"] = 1.1 + regime * 0.4 + rng.normal(0, 0.05, len(dates))
     frame["yield_curve_10y2y"] = 1.0 - regime * 0.4
     frame["yield_curve_10y3m"] = 1.2 - regime * 0.45
     frame["financial_conditions"] = -0.5 + regime * 0.7

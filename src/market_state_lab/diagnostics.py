@@ -39,11 +39,20 @@ def run_diagnostics(config: dict[str, Any]) -> pd.DataFrame:
     # check read a config key nothing enforced, so it always passed and said
     # nothing; the real guarantee is that a connection needs the --with-ibkr
     # flag, and ibkr.enabled can now refuse even that.
+    pipeline_source = (PROJECT_ROOT / "src" / "market_state_lab" / "pipeline.py").read_text(
+        encoding="utf-8"
+    )
+    gated = (
+        pipeline_source.count("ReadOnlyIBKRClient(") == 1
+        and "if with_ibkr:" in pipeline_source
+        and pipeline_source.index("state = fit_market_state")
+        < pipeline_source.index("if with_ibkr:")
+    )
     rows.append(
         {
             "check": "ibkr:connection_requires_explicit_flag",
-            "status": "ok",
-            "detail": "pipeline connects only with --with-ibkr; enabled=" + str(enabled),
+            "status": "ok" if gated else "failed",
+            "detail": f"single client behind --with-ibkr, after the model runs; enabled={enabled}",
         }
     )
 

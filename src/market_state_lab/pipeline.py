@@ -43,12 +43,16 @@ def _feature_coverage(features: pd.DataFrame, config: dict[str, Any]) -> pd.Data
     rules = settings.get("rules", {}) or {}
     total = len(features)
     rows: list[dict[str, Any]] = []
-    for column in features.columns:
+    # Iterating the surviving columns made this fail open in exactly the case
+    # it exists for: a source that fails health is dropped upstream, so the
+    # feature is never built and produced no row at all. Rules are included
+    # whether or not their column survived.
+    for column in dict.fromkeys([*features.columns, *rules]):
         rule = rules.get(str(column), {}) or {}
-        present = int(features[column].count())
+        present = int(features[column].count()) if column in features else 0
         coverage = present / total if total else float("nan")
         minimum = float(rule.get("min_coverage", default_minimum))
-        first_valid = features[column].first_valid_index()
+        first_valid = features[column].first_valid_index() if column in features else None
         rows.append(
             {
                 "feature": str(column),
@@ -113,7 +117,6 @@ def run_pipeline(
         processed = processed / "offline"
         reports.mkdir(parents=True, exist_ok=True)
         processed.mkdir(parents=True, exist_ok=True)
-    if offline:
         bundle = load_offline_fixture(config)
         fixture_end = max(
             frame.index.max()
@@ -173,6 +176,8 @@ def run_pipeline(
                 config,
                 fetch=bool(config["news"].get("fetch_on_run", False)),
                 use_llm=bool(config["news"].get("llm_enabled", True)),
+                processed_dir=processed,
+                reports_dir=reports,
             )
             news_evaluation = evaluate_news_forward(
                 news.daily_features, features.market["market_return"]
@@ -257,7 +262,7 @@ def run_pipeline(
 
     manifest.to_csv(reports / "data_manifest.csv", index=False)
     (reports / "latest_market_state.json").write_text(
-        json.dumps(state.latest, indent=2, ensure_ascii=False), encoding="utf-8"
+        json.dumps(state.latest, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8"
     )
     style.latest.to_csv(reports / "latest_style_state.csv", index=False)
     write_dashboard(reports / "market_state_dashboard.html", state, style, manifest, config)

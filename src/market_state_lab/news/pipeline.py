@@ -509,7 +509,12 @@ def run_news_pipeline(
     config: dict[str, Any],
     fetch: bool = False,
     use_llm: bool = True,
+    processed_dir: Path | None = None,
+    reports_dir: Path | None = None,
 ) -> NewsResult:
+    """`processed_dir`/`reports_dir` let an offline run keep its synthetic output
+    out of the live directories; it recomputed its own paths before and wrote
+    fixture news straight into reports/."""
     settings = config["news"]
     if fetch:
         _run_sidecar(config)
@@ -604,8 +609,8 @@ def run_news_pipeline(
         "llm_status": metadata.get("status"),
     }
 
-    processed = project_path(config, "data", "processed")
-    reports = project_path(config, "reports")
+    processed = processed_dir or project_path(config, "data", "processed")
+    reports = reports_dir or project_path(config, "reports")
     processed.mkdir(parents=True, exist_ok=True)
     reports.mkdir(parents=True, exist_ok=True)
     events.to_parquet(processed / "news_events.parquet", index=False)

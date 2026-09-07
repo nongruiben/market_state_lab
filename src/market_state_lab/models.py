@@ -102,6 +102,9 @@ def _ofr_columns(features: pd.DataFrame, mode: str) -> list[str]:
     return headline
 
 
+DEFAULT_REQUIRED_BLOCKS = ("risk_volatility", "risk_financial_conditions", "risk_trend_breadth")
+
+
 def _risk_blocks(features: pd.DataFrame, window: int, ofr_mode: str = "headline") -> pd.DataFrame:
     ofr = _ofr_columns(features, ofr_mode)
     blocks = {
@@ -209,8 +212,8 @@ PREFERRED_MODEL_COLUMNS = (
     "momentum_252",
     "drawdown_252",
     "vix_close",
-    "macro_hy_oas",
-    "macro_ig_oas",
+    "macro_baa_spread",
+    "credit_quality_spread",
     "macro_yield_curve_10y2y",
     "macro_financial_conditions",
     "credit_risk_return_21",
@@ -528,15 +531,62 @@ def _forward_volatility_target(
 
 
 def _climatology(target: pd.DataFrame, horizon: int, window: int, minimum: int) -> pd.DataFrame:
-    """No-skill reference forecast: the trailing base rate of the target.
+    """Trailing base rate of the target - the weakest honest reference.
 
-    Only outcomes settled by ``t`` contribute, so this is a forecast a person could
-    actually have made. Any model that cannot beat it has no demonstrated skill.
+    Only outcomes settled by ``t`` contribute, so this is a forecast a person
+    could actually have made. Beating it is necessary but nowhere near
+    sufficient: it ignores the single most obvious fact about volatility, which
+    is that it clusters. Use ``_persistence_forecast`` as the real bar.
     """
     settled = target.shift(horizon)
     rate = settled.rolling(window, min_periods=minimum).mean()
     total = rate.sum(axis=1).replace(0.0, np.nan)
     return rate.div(total, axis=0)
+
+
+def _persistence_forecast(
+    target: pd.DataFrame,
+    horizon: int,
+    window: int,
+    minimum: int,
+) -> pd.DataFrame:
+    """The benchmark a volatility target actually has to clear.
+
+    Volatility clusters, so "next period looks like the last one" is the free
+    forecast every practitioner already has. This is that rule made honest: the
+    last *settled* tercile label, mapped through trailing transition frequencies
+    estimated only from transitions that had themselves settled by ``t``.
+
+    It matters which bar is used. On the live panel this rule scores a forward
+    Brier of 0.513 while the calibrated ensemble scores 0.572 and the trailing
+    base rate scores 0.579 - so measuring against the base rate alone reports a
+    win where measuring against persistence reports a loss.
+    """
+    labelled = target.idxmax(axis=1).where(target.notna().all(axis=1))
+    previous = labelled.shift(horizon)
+    indicators = (
+        pd.get_dummies(labelled).reindex(columns=PROBABILITY_COLUMNS).astype(float)
+    )
+    forecast = pd.DataFrame(np.nan, index=target.index, columns=PROBABILITY_COLUMNS)
+    for state in PROBABILITY_COLUMNS:
+        from_state = previous.eq(state)
+        # Shifting by the horizon again is what keeps this causal: the outcome of
+        # a transition observed at u is only known at u + horizon.
+        denominator = (
+            from_state.astype(float).shift(horizon).rolling(window, min_periods=minimum).sum()
+        )
+        for outcome in PROBABILITY_COLUMNS:
+            numerator = (
+                indicators[outcome]
+                .where(from_state)
+                .shift(horizon)
+                .rolling(window, min_periods=minimum)
+                .sum()
+            )
+            share = numerator / denominator.replace(0.0, np.nan)
+            forecast.loc[from_state, outcome] = share[from_state]
+    total = forecast.sum(axis=1).replace(0.0, np.nan)
+    return forecast.div(total, axis=0)
 
 
 def _apply_temperature(log_probabilities: np.ndarray, temperature: np.ndarray) -> np.ndarray:
@@ -673,6 +723,7 @@ def _model_comparison(
     self_target: pd.DataFrame,
     forward_target: pd.DataFrame,
     climatology: pd.DataFrame | None = None,
+    persistence: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """Report both metrics side by side, with the no-skill row always present.
 
@@ -681,9 +732,27 @@ def _model_comparison(
     not interchangeable and the first one is roughly six times more flattering, so
     neither is ever published alone.
     """
-    scored = dict(probabilities)
+    benchmarks: dict[str, pd.DataFrame] = {}
     if climatology is not None:
-        scored["climatology"] = climatology
+        benchmarks["climatology"] = climatology
+    if persistence is not None:
+        benchmarks["persistence"] = persistence
+    scored = {**probabilities, **benchmarks}
+    # Every model and every benchmark is scored on ONE common day set - the days
+    # where all of them spoke. Pairing each model against a benchmark on its own
+    # coverage made the columns incomparable down the table: gmm was measured
+    # against a climatology Brier of 0.6825 while ensemble used 0.6859.
+    common = forward_target.notna().all(axis=1)
+    for frame in scored.values():
+        common &= frame.notna().all(axis=1)
+    common_observations = int(common.sum())
+    reference_brier: dict[str, float] = {}
+    if common_observations:
+        for name, frame in benchmarks.items():
+            reference_brier[name] = float(
+                ((frame.loc[common] - forward_target.loc[common]) ** 2).sum(axis=1).mean()
+            )
+
     rows: list[dict[str, Any]] = []
     for name, frame in scored.items():
         valid = frame.notna().all(axis=1) & self_target.notna().all(axis=1)
@@ -691,29 +760,15 @@ def _model_comparison(
         forward_brier, forward_hit, forward_observations = _score_against(frame, forward_target)
         if self_observations == 0 and forward_observations == 0:
             continue
-        # The learned models only start after minimum_train, so each model covers a
-        # different span. Comparing raw Brier across those spans would compare
-        # different markets, not different models: the skill delta is therefore
-        # always measured on the days where this model and climatology both spoke.
-        paired_brier = np.nan
-        paired_reference = np.nan
-        paired_observations = 0
-        if climatology is not None:
-            paired = (
-                frame.notna().all(axis=1)
-                & climatology.notna().all(axis=1)
-                & forward_target.notna().all(axis=1)
+        common_brier = np.nan
+        common_hit = np.nan
+        if common_observations:
+            common_brier = float(
+                ((frame.loc[common] - forward_target.loc[common]) ** 2).sum(axis=1).mean()
             )
-            if paired.any():
-                paired_observations = int(paired.sum())
-                paired_brier = float(
-                    ((frame.loc[paired] - forward_target.loc[paired]) ** 2).sum(axis=1).mean()
-                )
-                paired_reference = float(
-                    ((climatology.loc[paired] - forward_target.loc[paired]) ** 2)
-                    .sum(axis=1)
-                    .mean()
-                )
+            common_hit = float(
+                (frame.loc[common].idxmax(axis=1) == forward_target.loc[common].idxmax(axis=1)).mean()
+            )
         labelled = frame.dropna(how="any")
         if labelled.empty:
             flip_rate = np.nan
@@ -732,21 +787,40 @@ def _model_comparison(
                 "forward_brier": forward_brier,
                 "forward_hit_rate": forward_hit,
                 "forward_observations": forward_observations,
-                "paired_observations": paired_observations,
-                "paired_forward_brier": paired_brier,
-                "paired_climatology_brier": paired_reference,
-                "forward_brier_vs_climatology": paired_brier - paired_reference,
-                "beats_climatology": bool(paired_brier < paired_reference)
-                if np.isfinite(paired_brier) and np.isfinite(paired_reference)
-                else False,
+                "common_observations": common_observations,
+                "common_forward_brier": common_brier,
+                "common_forward_hit_rate": common_hit,
+                "climatology_brier": reference_brier.get("climatology", np.nan),
+                "persistence_brier": reference_brier.get("persistence", np.nan),
+                "vs_climatology": common_brier - reference_brier.get("climatology", np.nan),
+                "vs_persistence": common_brier - reference_brier.get("persistence", np.nan),
+                "beats_climatology": _beats(name, common_brier, reference_brier.get("climatology")),
+                # This is the verdict that means something. Volatility clusters, so
+                # a model that cannot beat "next period looks like the last one"
+                # has not earned its place regardless of what it does to the
+                # trailing base rate.
+                "beats_persistence": _beats(name, common_brier, reference_brier.get("persistence")),
                 "flip_rate": flip_rate,
                 "mean_duration_days": mean_duration,
             }
         )
-    comparison = pd.DataFrame(rows)
-    if not comparison.empty and "model" in comparison:
-        comparison.loc[comparison["model"].eq("climatology"), "beats_climatology"] = False
-    return comparison
+    return pd.DataFrame(rows)
+
+
+def _beats(name: str, brier: float, reference: float | None) -> bool:
+    """A benchmark never counts as beating itself."""
+    if reference is None or not np.isfinite(brier) or not np.isfinite(reference):
+        return False
+    if name in {"climatology", "persistence"}:
+        return False
+    return bool(brier < reference)
+
+
+def _block_indices(total: int, block: int, generator: np.random.Generator) -> np.ndarray:
+    """Circular block bootstrap indices - fixed-length wrapped blocks."""
+    blocks = int(np.ceil(total / block))
+    starts = generator.integers(0, total, size=blocks)
+    return (starts[:, None] + np.arange(block)[None, :]).ravel()[:total] % total
 
 
 def _bootstrap_sharpe_interval(
@@ -767,13 +841,10 @@ def _bootstrap_sharpe_interval(
         return np.nan, np.nan
     values = paired.to_numpy()
     total = len(values)
-    blocks = int(np.ceil(total / block))
     generator = np.random.default_rng(seed)
     differences = np.empty(draws)
     for draw in range(draws):
-        starts = generator.integers(0, total, size=blocks)
-        index = (starts[:, None] + np.arange(block)[None, :]).ravel()[:total] % total
-        sample = values[index]
+        sample = values[_block_indices(total, block, generator)]
         spreads = []
         for column in (0, 1):
             series = sample[:, column]
@@ -795,7 +866,15 @@ def _smooth_probabilities(frame: pd.DataFrame, half_life: float) -> pd.DataFrame
 
 
 def _drawdown_depth(returns: np.ndarray) -> tuple[float, float, float]:
-    """Worst, average and conditional (worst 5%) drawdown depth of one path."""
+    """Worst, average and conditional (worst 5%) drawdown depth of one path.
+
+    A single NaN would otherwise poison the cumulative product and return three
+    silent NaNs, which downstream reads as "no effect" rather than "not computed".
+    """
+    finite = returns[np.isfinite(returns)]
+    if len(finite) == 0:
+        return float("nan"), float("nan"), float("nan")
+    returns = finite
     wealth = np.cumprod(1.0 + returns)
     drawdown = wealth / np.maximum.accumulate(wealth) - 1.0
     cutoff = np.quantile(drawdown, 0.05)
@@ -830,13 +909,10 @@ def _bootstrap_drawdown_interval(
         return np.nan, np.nan
     values = paired.to_numpy()
     total = len(values)
-    blocks = int(np.ceil(total / block))
     generator = np.random.default_rng(seed)
     differences = np.empty(draws)
     for draw in range(draws):
-        starts = generator.integers(0, total, size=blocks)
-        index = (starts[:, None] + np.arange(block)[None, :]).ravel()[:total] % total
-        sample = values[index]
+        sample = values[_block_indices(total, block, generator)]
         differences[draw] = _drawdown_depth(sample[:, 0])[1] - _drawdown_depth(sample[:, 1])[1]
     finite = differences[np.isfinite(differences)]
     if len(finite) < draws // 2:
@@ -865,8 +941,8 @@ def _decision_value(
         return pd.DataFrame()
     evaluation = settings.get("decision_evaluation", {}) or {}
     target_volatility = float(settings.get("evaluation_target_volatility", 0.10))
-    haircut = float(evaluation.get("high_risk_exposure_haircut", 0.45))
-    cost_bps = float(evaluation.get("transaction_cost_bps", 0.0))
+    haircut = float(evaluation.get("high_risk_exposure_haircut", 0.0))
+    cost_bps = float(evaluation.get("transaction_cost_bps", 2.0))
     draws = int(evaluation.get("bootstrap_draws", 500))
     block = int(evaluation.get("bootstrap_block_days", 21))
     seed = int(evaluation.get("bootstrap_seed", 42))
@@ -902,11 +978,16 @@ def _decision_value(
         if name != "buy_and_hold":
             common &= applied.notna()
 
-    daily_rate = (
-        risk_free.reindex(features.index).fillna(0.0)
-        if risk_free is not None
-        else pd.Series(0.0, index=features.index)
-    )
+    # A column called sharpe_excess_of_cash must not quietly become excess of
+    # zero when the French feed is missing or gappy, so the realised coverage is
+    # reported alongside it and the name changes when there is no rate at all.
+    if risk_free is None:
+        daily_rate = pd.Series(0.0, index=features.index)
+        rate_coverage = 0.0
+    else:
+        aligned = risk_free.reindex(features.index)
+        rate_coverage = float(aligned.notna().mean())
+        daily_rate = aligned.fillna(0.0)
     net_returns: dict[str, pd.Series] = {}
     for name, applied in applied_candidates.items():
         gross = applied * features["market_return"]
@@ -915,6 +996,23 @@ def _decision_value(
 
     reference = net_returns.get("buy_and_hold")
     state_reference = net_returns.get("vol_only")
+    # A haircut both de-risks AND de-leverages, and vol_only does neither, so a
+    # win against it can be bought with nothing but a lower average position.
+    # Verified: replacing the signal with a constant that holds the SAME average
+    # exposure reproduces the entire measured drawdown edge. The honest control
+    # is therefore exposure-matched - same average position, no signal at all.
+    matched_returns: dict[str, pd.Series] = {}
+    baseline_exposure = applied_candidates["vol_only"].loc[common]
+    for name, applied in applied_candidates.items():
+        if name in {"buy_and_hold", "vol_only"}:
+            continue
+        scale = float(applied.loc[common].mean() / baseline_exposure.mean())
+        matched = vol_exposure * scale
+        matched_applied = matched.shift(1)
+        matched_returns[name] = (
+            matched_applied * features["market_return"]
+            - matched_applied.diff().abs().fillna(0.0) * (cost_bps / 10000.0)
+        ).loc[common]
     rows: list[dict[str, Any]] = []
     for name, strategy_return in net_returns.items():
         if len(strategy_return) < 126:
@@ -941,9 +1039,14 @@ def _decision_value(
         # Against vol_only, not buy-and-hold: vol_only is this same strategy with
         # the state layer removed, so the gap is exactly what the state buys.
         drawdown_low, drawdown_high = (np.nan, np.nan)
+        matched_low, matched_high = (np.nan, np.nan)
+        mean_exposure = float(applied_candidates[name].loc[strategy_return.index].mean())
         if state_reference is not None and name not in {"buy_and_hold", "vol_only"}:
             drawdown_low, drawdown_high = _bootstrap_drawdown_interval(
                 strategy_return, state_reference.loc[strategy_return.index], draws, block, seed
+            )
+            matched_low, matched_high = _bootstrap_drawdown_interval(
+                strategy_return, matched_returns[name].loc[strategy_return.index], draws, block, seed
             )
         rows.append(
             {
@@ -960,6 +1063,7 @@ def _decision_value(
                 "tail_loss_5pct_20d": float(horizon_return.quantile(0.05)),
                 "tail_loss_1pct_20d": float(horizon_return.quantile(0.01)),
                 "sharpe_excess_of_cash": sharpe,
+                "risk_free_coverage": rate_coverage,
                 "sharpe_diff_vs_buy_and_hold_ci_low": low,
                 "sharpe_diff_vs_buy_and_hold_ci_high": high,
                 "significant_vs_buy_and_hold": bool(
@@ -967,10 +1071,20 @@ def _decision_value(
                 ),
                 "drawdown_reduction_vs_vol_only_ci_low": drawdown_low,
                 "drawdown_reduction_vs_vol_only_ci_high": drawdown_high,
+                "mean_exposure": mean_exposure,
+                # Conflates signal with de-leveraging. Kept for continuity only.
                 "drawdown_significant_vs_vol_only": bool(
                     np.isfinite(drawdown_low)
                     and np.isfinite(drawdown_high)
                     and (drawdown_low > 0 or drawdown_high < 0)
+                ),
+                "drawdown_reduction_vs_matched_ci_low": matched_low,
+                "drawdown_reduction_vs_matched_ci_high": matched_high,
+                # This is the one that isolates the signal.
+                "drawdown_significant_vs_matched": bool(
+                    np.isfinite(matched_low)
+                    and np.isfinite(matched_high)
+                    and (matched_low > 0 or matched_high < 0)
                 ),
                 "transaction_cost_bps": cost_bps,
                 "high_risk_exposure_haircut": haircut,
@@ -1000,8 +1114,8 @@ def _exposure_tradeoff(
         return pd.DataFrame()
     evaluation = settings.get("decision_evaluation", {}) or {}
     target_volatility = float(settings.get("evaluation_target_volatility", 0.10))
-    cost_bps = float(evaluation.get("transaction_cost_bps", 0.0))
-    selected = float(evaluation.get("high_risk_exposure_haircut", 0.45))
+    cost_bps = float(evaluation.get("transaction_cost_bps", 2.0))
+    selected = float(evaluation.get("high_risk_exposure_haircut", 0.0))
     grid = [float(value) for value in evaluation.get("haircut_grid", [0.0, 0.25, 0.45, 0.65, 0.85, 1.0])]
 
     cap = float(evaluation.get("exposure_cap", 1.0))
@@ -1011,7 +1125,7 @@ def _exposure_tradeoff(
         features["market_return"].notna()
         & vol_exposure.notna()
         & decision_probabilities.notna().all(axis=1)
-    ).shift(1).fillna(False) & features["market_return"].notna()
+    ).shift(1, fill_value=False) & features["market_return"].notna()
     if int(common.sum()) < 252:
         return pd.DataFrame()
 
@@ -1069,7 +1183,7 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
     # _rolling_percentile then ranked today's value against a window built from the
     # other composition. Fix the composition instead, and let a missing required
     # block produce NaN rather than a quietly different score.
-    configured_blocks = config["features"].get("required_risk_blocks") or list(blocks.columns)
+    configured_blocks = config["features"].get("required_risk_blocks") or DEFAULT_REQUIRED_BLOCKS
     required_blocks = [str(name) for name in configured_blocks]
     unknown = [name for name in required_blocks if name not in blocks.columns]
     if unknown:
@@ -1092,8 +1206,12 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
         vix_band = pd.Series(pd.NA, index=features.index, dtype="object", name="vix_band")
     baseline = _baseline_probabilities(risk_percentile)
     candidates = _candidate_columns(features, ofr_model_mode)
-    if len(candidates) < 3:
-        raise ValueError(f"Only {len(candidates)} candidate regime features; at least 3 are required")
+    # Name presence is not availability: build_features always creates several of
+    # these, so a check on len(candidates) can never fire. Count columns that
+    # actually carry data over the training span.
+    usable = [c for c in candidates if features[c].count() >= 120]
+    if len(usable) < 3:
+        raise ValueError(f"Only {len(usable)} regime features carry data; at least 3 are required")
 
     learned, switch_probability, diagnostics = _fit_walk_forward_models(
         features[candidates].copy(), risk_score, settings, random_seed
@@ -1118,6 +1236,9 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
         features["market_return"], forward_horizon, forward_window, forward_minimum
     )
     climatology = _climatology(forward_target, forward_horizon, forward_window, forward_minimum)
+    persistence = _persistence_forecast(
+        forward_target, forward_horizon, forward_window, forward_minimum
+    )
 
     calibration = settings.get("calibration", {}) or {}
     if bool(calibration.get("enabled", True)):
@@ -1222,7 +1343,7 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
         "ensemble_calibrated": calibrated,
     }
     comparison = _model_comparison(
-        evaluated_probabilities, self_target, forward_target, climatology
+        evaluated_probabilities, self_target, forward_target, climatology, persistence
     )
     if not comparison.empty and "beats_climatology" in comparison:
         headline = comparison.loc[comparison["model"].eq("ensemble_calibrated")]
@@ -1230,13 +1351,16 @@ def fit_market_state(features: pd.DataFrame, config: dict[str, Any]) -> MarketSt
         if not headline.empty and not reference.empty:
             latest["forward_skill"] = {
                 "target": f"tercile of realised volatility over the next {forward_horizon} sessions",
-                "forward_brier": float(headline["paired_forward_brier"].iloc[0]),
-                "climatology_brier": float(headline["paired_climatology_brier"].iloc[0]),
+                "observations": int(headline["common_observations"].iloc[0]),
+                "forward_brier": float(headline["common_forward_brier"].iloc[0]),
+                "forward_hit_rate": float(headline["common_forward_hit_rate"].iloc[0]),
+                "climatology_brier": float(headline["climatology_brier"].iloc[0]),
+                "persistence_brier": float(headline["persistence_brier"].iloc[0]),
                 "beats_climatology": bool(headline["beats_climatology"].iloc[0]),
-                "forward_hit_rate": float(headline["forward_hit_rate"].iloc[0]),
-                "climatology_hit_rate": float(reference["forward_hit_rate"].iloc[0]),
-                "observations": int(headline["paired_observations"].iloc[0]),
-                "note": "scored on the days this model and climatology both covered",
+                # Persistence is the bar that matters for a volatility target.
+                "beats_persistence": bool(headline["beats_persistence"].iloc[0]),
+                "climatology_hit_rate": float(reference["common_forward_hit_rate"].iloc[0]),
+                "note": "every figure scored on the one day set all forecasters covered",
             }
     decision_value = _decision_value(
         features,

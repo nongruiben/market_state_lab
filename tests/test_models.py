@@ -184,22 +184,30 @@ def test_comparison_reports_both_metrics_against_a_no_skill_row() -> None:
     required = {
         "self_consistency_brier",
         "forward_brier",
-        "forward_hit_rate",
-        "paired_forward_brier",
-        "paired_climatology_brier",
-        "forward_brier_vs_climatology",
+        "common_forward_brier",
+        "common_forward_hit_rate",
+        "climatology_brier",
+        "persistence_brier",
+        "vs_climatology",
+        "vs_persistence",
         "beats_climatology",
+        "beats_persistence",
     }
     assert required.issubset(comparison.columns)
-    # The no-skill reference must always be on the table; without it a Brier
-    # number cannot be read as skill at all.
-    assert "climatology" in set(comparison["model"])
+    # BOTH references must be present. Climatology alone is far too weak a bar
+    # for a clustered series: measuring against it reported a win where
+    # persistence reports a loss.
+    assert {"climatology", "persistence"}.issubset(set(comparison["model"]))
     assert "ensemble_calibrated" in set(comparison["model"])
-    assert not comparison.loc[comparison["model"].eq("climatology"), "beats_climatology"].any()
-    # Every skill delta must be measured on days both forecasts covered.
-    scored = comparison.loc[comparison["paired_observations"].gt(0)]
-    assert not scored.empty
-    assert scored["paired_climatology_brier"].notna().all()
+    for name in ("climatology", "persistence"):
+        row = comparison.loc[comparison["model"].eq(name)]
+        assert not row["beats_climatology"].any()
+        assert not row["beats_persistence"].any()
+    # One common day set for every row, so the columns compare downwards.
+    assert comparison["common_observations"].nunique() == 1
+    assert comparison["common_observations"].iloc[0] > 0
+    assert comparison["climatology_brier"].nunique() == 1
+    assert comparison["persistence_brier"].nunique() == 1
     assert "observable_brier" not in comparison.columns
 
 
@@ -241,26 +249,37 @@ def test_forward_target_thresholds_are_prefix_invariant() -> None:
     np.testing.assert_allclose(left.loc[common].to_numpy(), right.loc[common].to_numpy())
 
 
-def test_calibrated_ensemble_retains_forward_skill() -> None:
-    """Regression guard on the only result that means anything.
+def test_forward_skill_is_reported_against_both_references() -> None:
+    """This test used to assert the model had skill. It does not.
 
-    Every other test here checks plumbing, so a change that quietly pushed the
-    forecast back below no-skill would leave the suite green. On the 26-year live
-    panel the calibrated ensemble scores 0.566 against climatology 0.686; on this
-    synthetic bundle the margin is about -0.26. The floor below is deliberately
-    loose - it exists to catch a collapse, not to pin a number.
+    On the live panel the calibrated ensemble scores 0.572 against 0.579 for the
+    trailing base rate and 0.513 for a two-line persistence rule, so the earlier
+    version pinned a conclusion that held only because the bar was too low. What
+    is worth guarding is that both references are always published and that the
+    verdict is computed from the numbers rather than asserted.
     """
     state, _ = _configured_state()
+    skill = state.latest["forward_skill"]
+    for key in (
+        "forward_brier",
+        "climatology_brier",
+        "persistence_brier",
+        "beats_climatology",
+        "beats_persistence",
+        "observations",
+    ):
+        assert key in skill
+    assert skill["observations"] > 0
     comparison = state.comparison.set_index("model")
     calibrated = comparison.loc["ensemble_calibrated"]
-    raw = comparison.loc["ensemble"]
-
-    assert bool(calibrated["beats_climatology"])
-    assert calibrated["forward_brier_vs_climatology"] < -0.05
-    # Calibration is the step that bought the skill: it must not stop paying.
-    assert calibrated["paired_forward_brier"] < raw["paired_forward_brier"]
-    assert calibrated["forward_hit_rate"] > comparison.loc["climatology", "forward_hit_rate"]
-    assert state.latest["forward_skill"]["beats_climatology"] is True
+    assert bool(skill["beats_persistence"]) == bool(
+        calibrated["common_forward_brier"] < calibrated["persistence_brier"]
+    )
+    assert bool(skill["beats_climatology"]) == bool(
+        calibrated["common_forward_brier"] < calibrated["climatology_brier"]
+    )
+    # Calibration must at least not make the raw ensemble worse.
+    assert calibrated["common_forward_brier"] <= comparison.loc["ensemble", "common_forward_brier"]
 
 
 def test_decision_value_scores_drawdown_against_the_no_state_benchmark() -> None:

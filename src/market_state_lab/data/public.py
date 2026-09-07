@@ -103,7 +103,10 @@ class PublicDataLoader:
         series = pd.to_numeric(raw[raw.columns[-1]], errors="coerce")
         series.index = pd.to_datetime(raw[raw.columns[0]], errors="coerce")
         series.name = name
-        return self._clean_index(series.to_frame()).loc[self.start_date :], result.status
+        # dropna matters: FRED pads market holidays with '.', and keeping those
+        # rows made observation_density structurally 1.0 for every FRED series.
+        frame = self._clean_index(series.to_frame()).dropna()
+        return frame.loc[self.start_date :], result.status
 
     def _fred_api_series(self, series_id: str, name: str, api_key: str) -> tuple[pd.DataFrame, str]:
         """Official observations endpoint. Returns the complete series, including
@@ -152,9 +155,12 @@ class PublicDataLoader:
                     try:
                         frame, status = self._fred_api_series(str(series_id), str(name), api_key)
                         provider = "FRED API"
-                    except Exception:
+                    except Exception as api_error:
                         frame, status = self._fred_graph_series(str(series_id), str(name))
-                        provider = "FRED graph CSV (API fallback)"
+                        provider = (
+                            "FRED graph CSV (API fallback: "
+                            f"{_redact_secrets(str(api_error))[:80]})"
+                        )
                     record_vintage = "latest_revised"
                 else:
                     frame, status = self._fred_graph_series(str(series_id), str(name))
