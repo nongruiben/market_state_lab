@@ -196,56 +196,98 @@ class ReadOnlyIBKRClient:
         )
         return contract
 
-    def quotes(self, contracts: list[Any]) -> pd.DataFrame:
-        """Snapshot quotes carrying their own status, times and actual data type."""
+    def quotes(
+        self,
+        contracts: list[Any],
+        wait_seconds: float = 12.0,
+        generic_ticks: str | None = None,
+    ) -> pd.DataFrame:
+        """Streaming quotes carrying their own status, times and actual data type.
+
+        Streaming, not `reqTickers`. That helper sends a *snapshot* request, and
+        IB does not serve delayed data to snapshots: on a delayed entitlement
+        every field comes back empty, so the account looks unsubscribed when it
+        is not. This module ran that way and reported `close_only` for SPY and
+        nothing at all for its options, both of which quote fine over a
+        streaming subscription. The request shape was the fault, not the
+        entitlement.
+
+        Every contract is subscribed before the wait and read after it, so the
+        cost is one wait rather than one per contract, and the subscriptions are
+        cancelled on the way out either way - a market-data line left open is a
+        real leak against a capped allowance.
+
+        `generic_ticks` defaults to 106 (model greeks) when any contract is an
+        option. Implied vol and the underlying price TWS priced against are what
+        make a quote interpretable afterwards; they are recorded here, never used
+        to value anything.
+        """
         ib = self._require()
-        received = datetime.now(timezone.utc)
-        tickers = ib.reqTickers(*contracts)
-        rows: list[dict[str, Any]] = []
-        for ticker in tickers:
-            contract = ticker.contract
-            actual = getattr(ticker, "marketDataType", None)
-            exchange_time = getattr(ticker, "time", None)
-            if exchange_time is not None and exchange_time.tzinfo is None:
-                exchange_time = exchange_time.replace(tzinfo=timezone.utc)
-            has_two_sided = _finite(ticker.bid) and _finite(ticker.ask)
-            has_any = has_two_sided or _finite(ticker.last) or _finite(
-                getattr(ticker, "close", None)
+        if generic_ticks is None:
+            generic_ticks = (
+                "106" if any(getattr(c, "secType", "") == "OPT" for c in contracts) else ""
             )
-            rows.append(
-                {
-                    "symbol": contract.symbol,
-                    "con_id": contract.conId,
-                    "sec_type": contract.secType,
-                    "expiry": getattr(contract, "lastTradeDateOrContractMonth", "") or None,
-                    "strike": getattr(contract, "strike", 0.0) or None,
-                    "right": getattr(contract, "right", "") or None,
-                    "multiplier": getattr(contract, "multiplier", "") or None,
-                    "bid": _clean(ticker.bid),
-                    "ask": _clean(ticker.ask),
-                    "last": _clean(ticker.last),
-                    "close": _clean(getattr(ticker, "close", None)),
-                    "bid_size": _clean(ticker.bidSize),
-                    "ask_size": _clean(ticker.askSize),
-                    "exchange_time_utc": exchange_time,
-                    "received_at_utc": received,
-                    "quote_age_seconds": (
-                        (received - exchange_time).total_seconds() if exchange_time else None
-                    ),
-                    "requested_market_data_type": self.settings.market_data_type,
-                    "actual_market_data_type": actual,
-                    "actual_market_data_type_name": MARKET_DATA_TYPE_NAMES.get(actual),
-                    # Requested type does not imply returned type, and a snapshot
-                    # that timed out half-filled must not look like a full one.
-                    # Two-sided is what pricing a trade needs; a lone close can
-                    # describe the market but cannot cost an option.
-                    "status": (
-                        "complete" if has_two_sided else ("close_only" if has_any else "empty")
-                    ),
-                }
-            )
-        self.log.record(event="quotes", requested=len(contracts), returned=len(rows))
+        tickers = [ib.reqMktData(c, generic_ticks, False, False) for c in contracts]
+        try:
+            ib.sleep(wait_seconds)
+            received = datetime.now(timezone.utc)
+            rows = [self._quote_row(ticker, received) for ticker in tickers]
+        finally:
+            for contract in contracts:
+                ib.cancelMktData(contract)
+        self.log.record(
+            event="quotes",
+            requested=len(contracts),
+            returned=len(rows),
+            generic_ticks=generic_ticks,
+            wait_seconds=wait_seconds,
+        )
         return pd.DataFrame(rows)
+
+    def _quote_row(self, ticker: Any, received: datetime) -> dict[str, Any]:
+        """One ticker to one row, carrying what a reader needs to discount it."""
+        contract = ticker.contract
+        actual = getattr(ticker, "marketDataType", None)
+        exchange_time = getattr(ticker, "time", None)
+        if exchange_time is not None and exchange_time.tzinfo is None:
+            exchange_time = exchange_time.replace(tzinfo=timezone.utc)
+        has_two_sided = _finite(ticker.bid) and _finite(ticker.ask)
+        has_any = has_two_sided or _finite(ticker.last) or _finite(getattr(ticker, "close", None))
+        greeks = getattr(ticker, "modelGreeks", None)
+        return {
+            "symbol": contract.symbol,
+            "con_id": contract.conId,
+            "sec_type": contract.secType,
+            "expiry": getattr(contract, "lastTradeDateOrContractMonth", "") or None,
+            "strike": getattr(contract, "strike", 0.0) or None,
+            "right": getattr(contract, "right", "") or None,
+            "multiplier": getattr(contract, "multiplier", "") or None,
+            "bid": _clean(ticker.bid),
+            "ask": _clean(ticker.ask),
+            "last": _clean(ticker.last),
+            "close": _clean(getattr(ticker, "close", None)),
+            "bid_size": _clean(ticker.bidSize),
+            "ask_size": _clean(ticker.askSize),
+            "exchange_time_utc": exchange_time,
+            "received_at_utc": received,
+            "quote_age_seconds": (
+                (received - exchange_time).total_seconds() if exchange_time else None
+            ),
+            "requested_market_data_type": self.settings.market_data_type,
+            "actual_market_data_type": actual,
+            "actual_market_data_type_name": MARKET_DATA_TYPE_NAMES.get(actual),
+            # Requested type does not imply returned type, and a subscription
+            # that never filled must not look like a full one. Two-sided is what
+            # pricing a trade needs; a lone close can describe the market but
+            # cannot cost an option.
+            "status": ("complete" if has_two_sided else ("close_only" if has_any else "empty")),
+            # Reported by TWS, not computed here. `underlying_price` is the spot
+            # the option quote was formed against, which is the only spot that
+            # makes its moneyness self-consistent.
+            "implied_volatility": _clean(getattr(greeks, "impliedVol", None)),
+            "delta": getattr(greeks, "delta", None) if greeks else None,
+            "underlying_price": _clean(getattr(greeks, "undPrice", None)),
+        }
 
     def historical_daily_bars(
         self,
@@ -381,6 +423,38 @@ class ReadOnlyIBKRClient:
         )
         return strikes
 
+    def qualify_options(
+        self,
+        symbol: str,
+        expiry: str,
+        strikes: list[float],
+        right: str = "P",
+        exchange: str = "SMART",
+        trading_class: str | None = None,
+    ) -> list[Any]:
+        """Qualify option contracts, dropping combinations TWS rejects.
+
+        Calls matter here even though nothing in this project buys one: the
+        put-call parity check needs the call opposite each put, and it is the
+        only way to tell a coherent quote set from a plausible-looking one
+        without a second data source.
+        """
+        ib = self._require()
+        wanted = [
+            Option(symbol, expiry, strike, right, exchange, tradingClass=trading_class or symbol)
+            for strike in strikes
+        ]
+        qualified = [c for c in ib.qualifyContracts(*wanted) if getattr(c, "conId", 0)]
+        self.log.record(
+            event="qualify_options",
+            symbol=symbol,
+            expiry=expiry,
+            right=right,
+            requested=len(wanted),
+            qualified=len(qualified),
+        )
+        return qualified
+
     def qualify_puts(
         self,
         symbol: str,
@@ -390,20 +464,9 @@ class ReadOnlyIBKRClient:
         trading_class: str | None = None,
     ) -> list[Any]:
         """Qualify put contracts, dropping strike/expiry combinations TWS rejects."""
-        ib = self._require()
-        wanted = [
-            Option(symbol, expiry, strike, "P", exchange, tradingClass=trading_class or symbol)
-            for strike in strikes
-        ]
-        qualified = [c for c in ib.qualifyContracts(*wanted) if getattr(c, "conId", 0)]
-        self.log.record(
-            event="qualify_puts",
-            symbol=symbol,
-            expiry=expiry,
-            requested=len(wanted),
-            qualified=len(qualified),
+        return self.qualify_options(
+            symbol, expiry, strikes, "P", exchange, trading_class
         )
-        return qualified
 
     @property
     def request_log(self) -> pd.DataFrame:

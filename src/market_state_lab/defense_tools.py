@@ -31,6 +31,8 @@ from typing import Any
 
 import pandas as pd
 
+from market_state_lab.scenarios import PutQuote
+
 
 @dataclass(frozen=True)
 class ExpiryBucket:
@@ -243,3 +245,127 @@ def quotable(candidates: pd.DataFrame) -> pd.DataFrame:
     if candidates.empty:
         return candidates
     return candidates.loc[candidates["status"].eq("ok")].reset_index(drop=True)
+
+
+def attach_contracts(candidates: pd.DataFrame, contracts: list[Any]) -> pd.DataFrame:
+    """Attach the conIds qualification returned, and mark whatever it did not.
+
+    Qualification is the last place a candidate can turn out not to exist, and a
+    row that silently loses its contract would otherwise be carried forward as
+    though it were still real.
+    """
+    if candidates.empty:
+        return candidates
+    by_key = {
+        (
+            str(getattr(c, "lastTradeDateOrContractMonth", "")),
+            float(getattr(c, "strike", 0.0)),
+        ): c
+        for c in contracts
+        if getattr(c, "conId", 0)
+    }
+    rows: list[dict[str, Any]] = []
+    for row in candidates.to_dict("records"):
+        if row.get("status") != "ok":
+            rows.append(row)
+            continue
+        contract = by_key.get((str(row["expiry"]), float(row["strike"])))
+        if contract is None:
+            rows.append({**row, "con_id": None, "status": "not_qualified"})
+            continue
+        rows.append(
+            {
+                **row,
+                "con_id": int(contract.conId),
+                "local_symbol": getattr(contract, "localSymbol", None) or None,
+            }
+        )
+    attached = pd.DataFrame(rows)
+    attached.attrs.update(candidates.attrs)
+    return attached
+
+
+def attach_quotes(candidates: pd.DataFrame, quotes: pd.DataFrame) -> pd.DataFrame:
+    """Join quotes onto qualified candidates by conId.
+
+    A candidate without a two-sided quote is kept and marked, never dropped: the
+    fact that one strike in a comparison could not be priced is itself the
+    finding, and a table that quietly showed five rows instead of six would hide
+    it. Only `priced` rows go on to the payoff arithmetic.
+
+    Nothing is filtered on spread or staleness here. Those are facts the row
+    carries so a reader can discount it; turning them into a threshold would be
+    this module deciding what is tradeable, which is not its job.
+    """
+    if candidates.empty:
+        return candidates
+    priced = {
+        int(row["con_id"]): row
+        for row in quotes.to_dict("records")
+        if pd.notna(row.get("con_id"))
+    }
+    rows: list[dict[str, Any]] = []
+    for row in candidates.to_dict("records"):
+        if row.get("status") != "ok":
+            rows.append(row)
+            continue
+        quote = priced.get(int(row["con_id"])) if pd.notna(row.get("con_id")) else None
+        if quote is None:
+            rows.append({**row, "status": "no_quote_returned"})
+            continue
+        bid, ask = quote.get("bid"), quote.get("ask")
+        merged = {
+            **row,
+            "bid": bid,
+            "ask": ask,
+            "quote_status": quote.get("status"),
+            "market_data_type": quote.get("actual_market_data_type_name"),
+            "quote_age_seconds": quote.get("quote_age_seconds"),
+            "implied_volatility": quote.get("implied_volatility"),
+            "delta": quote.get("delta"),
+            "underlying_price": quote.get("underlying_price"),
+        }
+        # The ask is the only price a buyer of protection actually pays, so a
+        # missing ask is fatal to the row even when a bid came through.
+        if ask is None or not pd.notna(ask) or ask <= 0:
+            rows.append({**merged, "status": "no_ask"})
+            continue
+        has_bid = bid is not None and pd.notna(bid) and bid > 0
+        rows.append(
+            {
+                **merged,
+                "spread": (ask - bid) if has_bid else None,
+                "relative_spread": ((ask - bid) / ask) if has_bid else None,
+                "status": "priced",
+            }
+        )
+    attached = pd.DataFrame(rows)
+    attached.attrs.update(candidates.attrs)
+    return attached
+
+
+def put_quotes(candidates: pd.DataFrame) -> list[PutQuote]:
+    """The priced rows as `PutQuote`s, ready for the payoff arithmetic."""
+    if candidates.empty:
+        return []
+    priced = candidates.loc[candidates["status"].eq("priced")]
+    return [
+        PutQuote(
+            symbol=str(row["symbol"]),
+            expiry=str(row["expiry"]),
+            strike=float(row["strike"]),
+            # A one-sided market is priceable but not measurable: NaN keeps the
+            # spread absent instead of inventing a zero bid.
+            bid=float(row["bid"]) if pd.notna(row.get("bid")) else float("nan"),
+            ask=float(row["ask"]),
+            multiplier=int(float(row["multiplier"])),
+            con_id=int(row["con_id"]) if pd.notna(row.get("con_id")) else None,
+            quote_age_seconds=(
+                float(row["quote_age_seconds"]) if pd.notna(row.get("quote_age_seconds")) else None
+            ),
+            market_data_type=(
+                str(row["market_data_type"]) if pd.notna(row.get("market_data_type")) else None
+            ),
+        )
+        for row in priced.to_dict("records")
+    ]
