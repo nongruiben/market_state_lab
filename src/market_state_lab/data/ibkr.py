@@ -69,6 +69,9 @@ class RequestLog:
 
 
 MARKET_DATA_TYPE_NAMES = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed_frozen"}
+# A frozen book is whatever the market last printed; TWS re-sends it on request,
+# so the tick timestamp is when it was pushed, not when the price was made.
+FROZEN_MARKET_DATA_TYPES = {2, 4}
 
 
 def installed_client_version() -> str | None:
@@ -270,8 +273,24 @@ class ReadOnlyIBKRClient:
             "ask_size": _clean(ticker.askSize),
             "exchange_time_utc": exchange_time,
             "received_at_utc": received,
-            "quote_age_seconds": (
+            # How long since TWS pushed the tick. This is NOT the age of the
+            # price, and conflating the two is how a book frozen since the
+            # previous Friday reported an age of nine seconds.
+            "tick_lag_seconds": (
                 (received - exchange_time).total_seconds() if exchange_time else None
+            ),
+            # Only meaningful when the tick timestamp tracks the market. On a
+            # frozen feed the book carries no formation time at all, so the
+            # honest value is absent and the caller must ask the calendar.
+            "quote_age_seconds": (
+                (received - exchange_time).total_seconds()
+                if exchange_time and actual not in FROZEN_MARKET_DATA_TYPES
+                else None
+            ),
+            "staleness_basis": (
+                "frozen_book_has_no_timestamp"
+                if actual in FROZEN_MARKET_DATA_TYPES
+                else ("tick_timestamp" if exchange_time else "unknown")
             ),
             "requested_market_data_type": self.settings.market_data_type,
             "actual_market_data_type": actual,

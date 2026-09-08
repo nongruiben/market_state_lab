@@ -31,6 +31,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from market_state_lab.timeutils import as_utc, last_completed_session
+
 # Parity fixes the slope at -e^(-rT). Anything outside this band is not a
 # mispriced chain, it is the wrong contracts paired up - a mismatched
 # multiplier, a different underlying, or calls and puts from different expiries.
@@ -134,3 +136,56 @@ def parity_verdict(checks: pd.DataFrame) -> str:
     if "parity_violated" in statuses or "slope_out_of_band" in statuses:
         return "failed"
     return "unverified"
+
+
+FROZEN_TYPE_NAMES = {"frozen", "delayed_frozen"}
+
+
+def staleness_note(
+    quotes: pd.DataFrame,
+    as_of: Any = None,
+    calendar_name: str = "XNYS",
+) -> dict[str, Any]:
+    """What "how old is this price" can honestly be answered with.
+
+    Parity proves a quote set is internally coherent. It says nothing about
+    when: a book frozen three days ago satisfies the identity exactly, because
+    every leg is stale by the same amount. Coherent and current are separate
+    questions and this answers the second one.
+
+    A frozen book carries no formation time. `ticker.time` is when TWS pushed
+    the tick, which on a frozen feed is now - so treating it as a quote age
+    reported nine seconds for prices last traded the previous Friday. When the
+    feed is frozen the only defensible answer comes from the calendar: the last
+    session that actually closed.
+    """
+    if quotes.empty:
+        return {"basis": "unknown", "note": "no quotes"}
+
+    types = sorted({str(t) for t in quotes["actual_market_data_type_name"].dropna()})
+    frozen = [t for t in types if t in FROZEN_TYPE_NAMES]
+    lags = pd.to_numeric(quotes.get("tick_lag_seconds"), errors="coerce").dropna()
+    note: dict[str, Any] = {
+        "market_data_types": types,
+        "max_tick_lag_seconds": float(lags.max()) if len(lags) else None,
+    }
+
+    if not frozen:
+        ages = pd.to_numeric(quotes.get("quote_age_seconds"), errors="coerce").dropna()
+        note["basis"] = "tick_timestamp"
+        note["max_quote_age_seconds"] = float(ages.max()) if len(ages) else None
+        note["note"] = "quote age is the tick timestamp, which tracks the market on this feed"
+        return note
+
+    session, close = last_completed_session(calendar_name, as_of)
+    now = as_utc(as_of)
+    hours = float((now - close).total_seconds() / 3600.0)
+    note["basis"] = "frozen_last_session" if len(frozen) == len(types) else "mixed"
+    note["last_completed_session"] = str(session.date())
+    note["session_close_utc"] = close.isoformat()
+    note["age_hours"] = hours
+    note["note"] = (
+        f"frozen book from the {session.date()} close, {hours:.1f}h old; "
+        "the tick lag is transport, not price age"
+    )
+    return note

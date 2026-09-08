@@ -22,7 +22,8 @@ class RunClock:
         return asdict(self)
 
 
-def _as_utc(value: datetime | pd.Timestamp | None) -> pd.Timestamp:
+def as_utc(value: datetime | pd.Timestamp | None) -> pd.Timestamp:
+    """A tz-aware UTC timestamp, defaulting to now. Naive input is read as UTC."""
     if value is None:
         return pd.Timestamp(datetime.now(timezone.utc))
     result = pd.Timestamp(value)
@@ -31,11 +32,33 @@ def _as_utc(value: datetime | pd.Timestamp | None) -> pd.Timestamp:
     return result.tz_convert("UTC")
 
 
+def last_completed_session(
+    calendar_name: str = "XNYS",
+    now: datetime | pd.Timestamp | None = None,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """The most recent session whose close is already in the past, and that close.
+
+    A frozen quote comes from this session and carries no timestamp of its own,
+    so this is the only defensible answer to "how old is this price".
+    """
+    now_utc = as_utc(now)
+    calendar = xcals.get_calendar(calendar_name)
+    sessions = calendar.sessions_in_range(
+        (now_utc - pd.Timedelta(days=14)).date(), (now_utc + pd.Timedelta(days=1)).date()
+    )
+    for session in reversed(list(sessions)):
+        close = pd.Timestamp(calendar.session_close(session))
+        close = close.tz_localize("UTC") if close.tzinfo is None else close.tz_convert("UTC")
+        if close <= now_utc:
+            return pd.Timestamp(session), close
+    raise RuntimeError(f"No completed {calendar_name} session before {now_utc.isoformat()}")
+
+
 def completed_market_clock(
     config: dict[str, Any],
     now: datetime | pd.Timestamp | None = None,
 ) -> RunClock:
-    now_utc = _as_utc(now)
+    now_utc = as_utc(now)
     project = config["project"]
     local_tz = ZoneInfo(str(project.get("timezone", "UTC")))
     calendar = xcals.get_calendar(str(project.get("market_calendar", "XNYS")))

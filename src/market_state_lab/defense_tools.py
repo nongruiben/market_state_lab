@@ -321,6 +321,8 @@ def attach_quotes(candidates: pd.DataFrame, quotes: pd.DataFrame) -> pd.DataFram
             "quote_status": quote.get("status"),
             "market_data_type": quote.get("actual_market_data_type_name"),
             "quote_age_seconds": quote.get("quote_age_seconds"),
+            "tick_lag_seconds": quote.get("tick_lag_seconds"),
+            "staleness_basis": quote.get("staleness_basis"),
             "implied_volatility": quote.get("implied_volatility"),
             "delta": quote.get("delta"),
             "underlying_price": quote.get("underlying_price"),

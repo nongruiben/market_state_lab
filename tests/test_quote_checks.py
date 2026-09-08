@@ -7,7 +7,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from market_state_lab.quote_checks import parity_verdict, put_call_parity_check
+from market_state_lab.quote_checks import (
+    parity_verdict,
+    put_call_parity_check,
+    staleness_note,
+)
 
 DAYS = {"20261009": 31, "20261120": 73}
 
@@ -149,3 +153,48 @@ def test_each_expiry_is_judged_on_its_own() -> None:
     assert by_expiry["20261120"] == "ok"
     assert by_expiry["20261009"] == "parity_violated"
     assert parity_verdict(checks) == "failed"
+
+
+def _feed(type_name: str, tick_lag: float = 9.03, quote_age=None) -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            {
+                "actual_market_data_type_name": type_name,
+                "tick_lag_seconds": tick_lag,
+                "quote_age_seconds": quote_age,
+            }
+        ]
+    )
+
+
+# 2026-09-07 was Labor Day, so the last close before this instant is 2026-09-04.
+AS_OF = "2026-09-08T07:59:39+00:00"
+
+
+def test_a_frozen_book_is_aged_from_the_calendar_not_from_the_tick() -> None:
+    note = staleness_note(_feed("delayed_frozen", tick_lag=9.03), as_of=AS_OF)
+    assert note["basis"] == "frozen_last_session"
+    assert note["last_completed_session"] == "2026-09-04"
+    # The bug this replaces: 9.03 seconds reported for a price made 84 hours ago.
+    assert note["age_hours"] == pytest.approx(83.99, abs=0.05)
+    assert note["max_tick_lag_seconds"] == 9.03
+
+
+def test_a_live_feed_may_use_its_tick_timestamp() -> None:
+    note = staleness_note(_feed("delayed", tick_lag=1.4, quote_age=1.4), as_of=AS_OF)
+    assert note["basis"] == "tick_timestamp"
+    assert note["max_quote_age_seconds"] == 1.4
+    assert "last_completed_session" not in note
+
+
+def test_one_frozen_leg_makes_the_whole_set_mixed() -> None:
+    quotes = pd.concat(
+        [_feed("delayed_frozen"), _feed("delayed", quote_age=1.4)], ignore_index=True
+    )
+    note = staleness_note(quotes, as_of=AS_OF)
+    assert note["basis"] == "mixed"
+    assert note["last_completed_session"] == "2026-09-04"
+
+
+def test_no_quotes_has_no_age_to_report() -> None:
+    assert staleness_note(pd.DataFrame())["basis"] == "unknown"

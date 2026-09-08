@@ -45,12 +45,17 @@ from market_state_lab.defense_tools import (  # noqa: E402
     resolve_strikes,
     select_chain,
 )
-from market_state_lab.quote_checks import parity_verdict, put_call_parity_check  # noqa: E402
+from market_state_lab.quote_checks import (  # noqa: E402
+    parity_verdict,
+    put_call_parity_check,
+    staleness_note,
+)
 from market_state_lab.scenarios import (  # noqa: E402
     ReferenceExposure,
     protective_put_scenarios,
     summarise_candidate,
 )
+from market_state_lab.timeutils import last_completed_session  # noqa: E402
 
 CLIENT_ID = 923
 
@@ -104,6 +109,12 @@ def main() -> int:
     parser.add_argument("--coverage", type=float, default=1.0)
     parser.add_argument("--wait", type=float, default=15.0, help="seconds to let quotes stream")
     parser.add_argument(
+        "--spot",
+        choices=("auto", "close", "last"),
+        default="auto",
+        help="which stock price to size against; auto follows the option book",
+    )
+    parser.add_argument(
         "--no-verify",
         action="store_true",
         help="skip the parity check; the table then reports itself as unverified",
@@ -115,19 +126,18 @@ def main() -> int:
 
     with ReadOnlyIBKRClient(config) as client:
         stock = client.qualify_stock(args.symbol)
-        stock_quote = client.quotes([stock], wait_seconds=args.wait).iloc[0]
-        spot = stock_quote["last"] or stock_quote["close"]
-        if not spot:
-            print(f"{args.symbol}: no usable spot ({stock_quote['status']}); stopping")
+
+        # Pass one: a provisional spot, only to choose which strikes to ask about.
+        # A few dollars either way barely moves which listed strike is nearest.
+        probe = client.quotes([stock], wait_seconds=args.wait).iloc[0]
+        provisional = probe["close"] or probe["last"]
+        if not provisional:
+            print(f"{args.symbol}: no usable spot ({probe['status']}); stopping")
             return 1
-        spot = float(spot)
-        print(
-            f"spot {spot} ({stock_quote['status']}, "
-            f"{stock_quote['actual_market_data_type_name']})"
-        )
+        provisional = float(provisional)
 
         chain = select_chain(client.option_parameters(stock), args.symbol)
-        plan = plan_candidates(args.symbol, chain, spot=spot, as_of=date.today())
+        plan = plan_candidates(args.symbol, chain, spot=provisional, as_of=date.today())
         listed = {
             expiry: client.listed_strikes(
                 args.symbol, expiry, "P", trading_class=chain["trading_class"]
@@ -151,13 +161,41 @@ def main() -> int:
                 )
         plan = attach_contracts(plan, puts)
 
-        quotes = (
-            client.quotes(puts + calls, wait_seconds=args.wait)
-            if (puts or calls)
-            else pd.DataFrame()
-        )
-        plan = attach_quotes(plan, quotes.loc[quotes["right"].eq("P")] if len(quotes) else quotes)
+        # Pass two: the stock rides in the same batch as the options, so both
+        # halves of the table are read from one moment on one feed.
+        batch = client.quotes([stock] + puts + calls, wait_seconds=args.wait)
         request_log = client.request_log
+
+    quotes = batch.loc[batch["sec_type"].eq("OPT")].reset_index(drop=True)
+    stock_quote = batch.loc[batch["sec_type"].eq("STK")].iloc[0]
+    stale = staleness_note(quotes) if len(quotes) else {"basis": "unknown", "note": "no quotes"}
+
+    # The spot has to come from the same world as the option book. A frozen book
+    # is whatever the market last settled at, so the close is its match; a live
+    # or delayed-streaming book belongs with the last print. Getting this
+    # backwards is silent and it happened: SPY quoted 767 pre-market on a Tuesday
+    # while every put was still frozen at Friday's 770.19 close, and the table
+    # sized an exposure and computed moneyness across the two.
+    frozen_book = stale["basis"] in {"frozen_last_session", "mixed"}
+    spot_source = args.spot if args.spot != "auto" else ("close" if frozen_book else "last")
+    spot = stock_quote[spot_source] or stock_quote["close"] or stock_quote["last"]
+    if not spot:
+        print(f"{args.symbol}: no usable spot ({stock_quote['status']}); stopping")
+        return 1
+    spot = float(spot)
+    session, session_close = last_completed_session()
+    plan = attach_quotes(plan, quotes.loc[quotes["right"].eq("P")] if len(quotes) else quotes)
+
+    print(
+        f"spot {spot} from the {spot_source} "
+        f"({stock_quote['status']}, {stock_quote['actual_market_data_type_name']}); "
+        f"option book is {stale['basis']}; last completed session {session.date()}"
+    )
+    if spot_source == "close" and probe["last"] and abs(probe["last"] / spot - 1.0) > 0.001:
+        print(
+            f"  note: the stock has since printed {probe['last']}, but the option book "
+            f"has not moved with it, so the close is the consistent pairing."
+        )
 
     days = {
         str(row["expiry"]): row["days_to_expiry"]
@@ -173,16 +211,34 @@ def main() -> int:
     print()
     print(plan.reindex(columns=PLAN_COLS).to_string(index=False))
 
+    # Frozen legs all come from one close, so they are directly comparable.
+    # Live legs stream while the underlying moves, and are not.
+    synchronous = stale["basis"] in {"frozen_last_session", "unknown"}
+    print(f"\n=== how old are these prices -> {stale.get('note', stale['basis'])} ===")
+
     print(f"\n=== quote verification: put-call parity -> {verdict.upper()} ===")
     if parity.empty:
         print("  not run; these quotes have not been checked against anything")
     else:
         print(parity.reindex(columns=PARITY_COLS).to_string(index=False))
         print(
-            "  slope is -e^-rT, so implied_rate is the cash rate net of the dividend\n"
-            "  priced into that expiry. Residuals are judged against the quoted\n"
-            "  spread, because a mid is only known to within half a spread per leg."
+            "  Coherence, not currency: a book frozen days ago satisfies the identity\n"
+            "  exactly, because every leg is stale together. Residuals are judged\n"
+            "  against the quoted spread, since a mid is known only to within half a\n"
+            "  spread per leg."
         )
+        if synchronous:
+            print(
+                "  Legs are synchronous, so implied_rate is legible: it should sit\n"
+                "  near the cash rate less the dividend priced into that expiry."
+            )
+        else:
+            print(
+                "  Legs stream asynchronously while the underlying moves, so\n"
+                "  implied_rate is NOT a rate estimate here: the slope amplifies that\n"
+                "  noise, and 0.01 of slope is ~12% of rate at 31 days. Only the\n"
+                "  residual test carries intraday."
+            )
     if verdict == "failed":
         print("\nquotes failed their own consistency check; not building a payoff table")
         return 1
@@ -228,6 +284,9 @@ def main() -> int:
                 "built_at_utc": datetime.now(timezone.utc).isoformat(),
                 "symbol": args.symbol,
                 "spot": spot,
+                "spot_source": args.spot,
+                "spot_session": str(session.date()),
+                "spot_session_close_utc": session_close.isoformat(),
                 "spot_status": stock_quote["status"],
                 "spot_market_data_type": stock_quote["actual_market_data_type_name"],
                 "reference_notional_usd": args.notional,
@@ -235,6 +294,8 @@ def main() -> int:
                 "actual_coverage_ratio": sizing["coverage_ratio"],
                 "trading_class": chain["trading_class"],
                 "parity_verdict": verdict,
+                "staleness": stale,
+                "legs_synchronous": synchronous,
                 "parity_checks": json.loads(parity.to_json(orient="records")),
                 "candidates": json.loads(plan.to_json(orient="records")),
                 "comparison": summaries,
