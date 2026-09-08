@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from market_state_lab.data.public import PublicDataBundle
+from market_state_lab.timeutils import market_sessions
 
 
 @dataclass
@@ -20,6 +21,7 @@ def _calendar(
     bundle: PublicDataBundle,
     start: pd.Timestamp,
     as_of: pd.Timestamp,
+    config: dict[str, Any],
 ) -> pd.DatetimeIndex:
     indexes = [
         frame.index
@@ -29,7 +31,11 @@ def _calendar(
     if not indexes:
         raise ValueError("No public data was downloaded")
     first_observation = min(index.min() for index in indexes)
-    return pd.date_range(max(start, first_observation), as_of.normalize(), freq="B")
+    return market_sessions(
+        str(config["project"].get("market_calendar", "XNYS")),
+        max(start, first_observation),
+        as_of,
+    )
 
 
 def _available_panel(
@@ -60,7 +66,7 @@ def build_features(
     lags = config["data"]["publication_lags_business_days"]
     runtime_as_of = as_of or config.get("_runtime", {}).get("market_session")
     end = pd.Timestamp(runtime_as_of) if runtime_as_of else pd.Timestamp.today().normalize()
-    calendar = _calendar(bundle, start, end)
+    calendar = _calendar(bundle, start, end, config)
     fred_lag_daily = int(lags["fred_daily"])
     fred_lag_weekly = int(lags["fred_weekly"])
     if str(config["data"].get("fred", {}).get("vintage_mode", "latest")) == "point_in_time":

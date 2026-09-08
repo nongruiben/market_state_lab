@@ -1066,25 +1066,28 @@ def _decision_value(
                 "risk_free_coverage": rate_coverage,
                 "sharpe_diff_vs_buy_and_hold_ci_low": low,
                 "sharpe_diff_vs_buy_and_hold_ci_high": high,
-                "significant_vs_buy_and_hold": bool(
-                    np.isfinite(low) and np.isfinite(high) and (low > 0 or high < 0)
-                ),
+                # Direction matters: a two-sided flag reported a significant
+                # DETERIORATION as "significant", which reads as a win.
+                "significant_vs_buy_and_hold": bool(np.isfinite(low) and low > 0),
+                "significantly_worse_than_buy_and_hold": bool(np.isfinite(high) and high < 0),
                 "drawdown_reduction_vs_vol_only_ci_low": drawdown_low,
                 "drawdown_reduction_vs_vol_only_ci_high": drawdown_high,
                 "mean_exposure": mean_exposure,
                 # Conflates signal with de-leveraging. Kept for continuity only.
                 "drawdown_significant_vs_vol_only": bool(
-                    np.isfinite(drawdown_low)
-                    and np.isfinite(drawdown_high)
-                    and (drawdown_low > 0 or drawdown_high < 0)
+                    np.isfinite(drawdown_low) and drawdown_low > 0
+                ),
+                "drawdown_significantly_worse_vs_vol_only": bool(
+                    np.isfinite(drawdown_high) and drawdown_high < 0
                 ),
                 "drawdown_reduction_vs_matched_ci_low": matched_low,
                 "drawdown_reduction_vs_matched_ci_high": matched_high,
                 # This is the one that isolates the signal.
                 "drawdown_significant_vs_matched": bool(
-                    np.isfinite(matched_low)
-                    and np.isfinite(matched_high)
-                    and (matched_low > 0 or matched_high < 0)
+                    np.isfinite(matched_low) and matched_low > 0
+                ),
+                "drawdown_significantly_worse_vs_matched": bool(
+                    np.isfinite(matched_high) and matched_high < 0
                 ),
                 "transaction_cost_bps": cost_bps,
                 "high_risk_exposure_haircut": haircut,

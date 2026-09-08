@@ -69,6 +69,26 @@ def completed_market_clock(
     )
 
 
+def market_sessions(
+    calendar_name: str,
+    start: Any,
+    end: Any,
+) -> pd.DatetimeIndex:
+    """Actual exchange sessions, not `freq="B"`.
+
+    A business-day index invents every market holiday. Forward-filling prices
+    onto those rows produced 252 phantom sessions over 2000-2026, each carrying
+    a 0.0 return that then entered every volatility and momentum window.
+    exchange_calendars defaults to a recent start, so it is passed explicitly.
+    """
+    first = pd.Timestamp(start).normalize()
+    calendar = xcals.get_calendar(
+        calendar_name, start=(first - pd.Timedelta(days=30)).date().isoformat()
+    )
+    sessions = calendar.sessions_in_range(first.date(), pd.Timestamp(end).normalize().date())
+    return pd.DatetimeIndex(sessions).tz_localize(None).normalize()
+
+
 def session_age(calendar_name: str, latest: Any, as_of: Any) -> int | None:
     latest_ts = pd.to_datetime(latest, errors="coerce")
     as_of_ts = pd.to_datetime(as_of, errors="coerce")
@@ -76,6 +96,5 @@ def session_age(calendar_name: str, latest: Any, as_of: Any) -> int | None:
         return None
     if latest_ts > as_of_ts:
         return 0
-    calendar = xcals.get_calendar(calendar_name)
-    sessions = calendar.sessions_in_range(latest_ts.date(), as_of_ts.date())
+    sessions = market_sessions(calendar_name, latest_ts, as_of_ts)
     return max(0, len(sessions) - 1)
