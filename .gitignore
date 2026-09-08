@@ -27,3 +27,6 @@ data/raw/alfred/
 
 # pytest scratch, used only when the system temp dir is unusable
 .pytest-tmp/
+
+# Local continuation scratch for the user's workflow harness, not project files
+msl_continue*.txt
