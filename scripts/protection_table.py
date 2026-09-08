@@ -268,7 +268,10 @@ def report(result: dict[str, Any], args: argparse.Namespace) -> None:
 
 
 
-def store(results: list[dict[str, Any]], args: argparse.Namespace, config: dict) -> str | None:
+def store(
+    results: list[dict[str, Any]], args: argparse.Namespace, config: dict,
+    requests: list | None = None,
+) -> str | None:
     """Write the run as an immutable snapshot, and say what it may be used for.
 
     This is where the history comes from. TWS will not sell option quotes for
@@ -328,6 +331,10 @@ def store(results: list[dict[str, Any]], args: argparse.Namespace, config: dict)
         session_date,
         frames,
         config,
+        # The lineage link: every request behind these tables, with its state
+        # and the hash of its raw payload. This is what makes the manifest able
+        # to point at the raw archive instead of merely existing next to it.
+        requests=requests,
         eligible_for=tuple(eligible),
         ineligibility=ineligible,
         project_root=ROOT,
@@ -380,6 +387,7 @@ def main() -> int:
             except Exception as exc:  # one bad underlying must not lose the others
                 results.append({"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"})
         request_log = client.request_log
+        records = client.records
 
     for result in results:
         report(result, args)
@@ -394,7 +402,7 @@ def main() -> int:
             "reference and a stated mapping,\nwhich this does not have."
         )
 
-    snapshot_id = store(results, args, config)
+    snapshot_id = store(results, args, config, requests=records)
 
     out = ROOT / "reports" / "protection_table.json"
     out.parent.mkdir(parents=True, exist_ok=True)

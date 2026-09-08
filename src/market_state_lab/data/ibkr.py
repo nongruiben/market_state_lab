@@ -28,12 +28,16 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from importlib import metadata
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
+
+from market_state_lab.config import project_path
+from market_state_lab.data.snapshots import RawArchive, RequestRecord
 
 try:
     from ib_async import IB, Option, StartupFetch, Stock
@@ -56,16 +60,100 @@ class IBKRConnectionSettings:
 
 
 @dataclass
-class RequestLog:
-    """Per-request provenance, so a quote can always be traced to its call."""
+class ArchiveSink:
+    """Every request leaves a RequestRecord and its payload in the raw archive.
 
-    entries: list[dict[str, Any]] = field(default_factory=list)
+    The plan's per-request contract: a monotonic request id inside a connection
+    generation, endpoint and parameters recorded, a real lifecycle, and the raw
+    response written to `data/raw/ibkr/{fetch_date}/{request_id}.json` exactly
+    once. The fault-injection matrix mutates these payloads; without them there
+    is nothing to inject into and nothing to replay.
 
-    def record(self, **fields: Any) -> None:
-        self.entries.append({"logged_at_utc": datetime.now(timezone.utc).isoformat(), **fields})
+    `state` is not a boolean: `complete` means the payload was written, `failed`
+    means the call raised and nothing was archived. A call that returned but
+    produced no rows is still `complete` - an empty answer is an answer.
+    """
+
+    root: Path
+    session_tag: str
+    sdk_version: str | None = None
+    server_version: str | None = None
+    provider: str = "ibkr"
+    records: list[RequestRecord] = field(default_factory=list)
+    _seq: int = 0
+    _archive_dates: dict[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self.archive = RawArchive(self.root)
+
+    def begin(
+        self,
+        endpoint: str,
+        contract: dict[str, Any] | None = None,
+        parameters: dict[str, Any] | None = None,
+    ) -> RequestRecord:
+        self._seq += 1
+        record = RequestRecord(
+            request_id=f"{self.session_tag}-{self._seq:04d}",
+            provider=self.provider,
+            session_tag=self.session_tag,
+            endpoint=endpoint,
+            contract=contract or {},
+            parameters=parameters or {},
+            requested_at_utc=datetime.now(timezone.utc).isoformat(),
+            sdk_version=self.sdk_version,
+            server_version=self.server_version,
+        )
+        self.records.append(record)
+        self._archive_dates[record.request_id] = datetime.now(timezone.utc).date().isoformat()
+        return record
+
+    def complete(self, record: RequestRecord, payload: Any, rows: int | None = None) -> None:
+        # The record embedded in the archive file must carry its final state.
+        # Writing it first and updating the in-memory list after would leave the
+        # file saying "pending" forever while the live record says "complete" -
+        # two answers to the same question.
+        finished = _replace(
+            record, state="complete", completed_at_utc=_now_iso(), rows=rows
+        )
+        _, digest = self.archive.write(
+            finished, payload, self._archive_dates[record.request_id]
+        )
+        self.records[self.records.index(record)] = _replace(finished, raw_sha256=digest)
+
+    def fail(self, record: RequestRecord, error: str) -> None:
+        self.records[self.records.index(record)] = _replace(
+            record, state="failed", error=error, completed_at_utc=_now_iso(),
+        )
 
     def frame(self) -> pd.DataFrame:
-        return pd.DataFrame(self.entries)
+        return pd.DataFrame([asdict(r) for r in self.records])
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _replace(record: RequestRecord, **changes: Any) -> RequestRecord:
+    return RequestRecord(**{**asdict(record), **changes})
+
+
+def _contract_identity(contract: Any) -> dict[str, Any]:
+    """The identity fields of a qualified contract, in a JSON-able form."""
+    return {
+        "con_id": getattr(contract, "conId", None),
+        "symbol": getattr(contract, "symbol", None),
+        "sec_type": getattr(contract, "secType", None),
+        "currency": getattr(contract, "currency", None),
+        "exchange": getattr(contract, "exchange", None),
+        "primary_exchange": getattr(contract, "primaryExchange", None),
+        "expiry": getattr(contract, "lastTradeDateOrContractMonth", None),
+        "strike": getattr(contract, "strike", None),
+        "right": getattr(contract, "right", None),
+        "multiplier": getattr(contract, "multiplier", None),
+        "trading_class": getattr(contract, "tradingClass", None),
+        "local_symbol": getattr(contract, "localSymbol", None),
+    }
 
 
 MARKET_DATA_TYPE_NAMES = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed_frozen"}
@@ -108,7 +196,10 @@ class ReadOnlyIBKRClient:
         if self.settings.market_data_type not in {1, 2, 3, 4}:
             raise ValueError("ibkr.market_data_type must be one of 1, 2, 3, or 4")
         self.ib: Any | None = None
-        self.log = RequestLog()
+        self._data_root = Path(project_path(config, "data"))
+        # Created on connect: one generation per connection, so a record from a
+        # previous session can never be mistaken for one from this one.
+        self.archive: ArchiveSink | None = None
 
     def __enter__(self) -> "ReadOnlyIBKRClient":
         self.connect()
@@ -143,13 +234,13 @@ class ReadOnlyIBKRClient:
         )
         ib.reqMarketDataType(self.settings.market_data_type)
         self.ib = ib
-        self.log.record(
-            event="connect",
-            host=self.settings.host,
-            port=self.settings.port,
-            client_id=self.settings.client_id,
-            requested_market_data_type=self.settings.market_data_type,
-            client_version=version,
+        self.archive = ArchiveSink(
+            self._data_root,
+            session_tag=(
+                f"c{self.settings.client_id}-"
+                f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+            ),
+            sdk_version=version,
             server_version=ib.client.serverVersion(),
         )
 
@@ -157,6 +248,9 @@ class ReadOnlyIBKRClient:
         if self.ib is not None and self.ib.isConnected():
             self.ib.disconnect()
         self.ib = None
+        # The archive is deliberately kept: callers read the request log after
+        # the `with` block closes, and dropping the records would erase the very
+        # provenance the block exists to produce.
 
     def _require(self) -> Any:
         if self.ib is None or not self.ib.isConnected():
@@ -169,35 +263,47 @@ class ReadOnlyIBKRClient:
         The old version returned a naive local datetime, which silently became
         whatever timezone the machine happened to be in.
         """
-        ib = self._require()
-        before = datetime.now(timezone.utc)
-        server = ib.reqCurrentTime()
-        after = datetime.now(timezone.utc)
-        if server.tzinfo is None:
-            server = server.replace(tzinfo=timezone.utc)
-        midpoint = before + (after - before) / 2
-        return {
-            "server_time_utc": server.astimezone(timezone.utc),
-            "local_time_utc": midpoint,
-            "skew_seconds": (server - midpoint).total_seconds(),
-            "round_trip_seconds": (after - before).total_seconds(),
-        }
+        record = self.archive.begin("reqCurrentTime")
+        try:
+            ib = self._require()
+            before = datetime.now(timezone.utc)
+            server = ib.reqCurrentTime()
+            after = datetime.now(timezone.utc)
+            if server.tzinfo is None:
+                server = server.replace(tzinfo=timezone.utc)
+            midpoint = before + (after - before) / 2
+            payload = {
+                "server_time_utc": server.astimezone(timezone.utc),
+                "local_time_utc": midpoint,
+                "skew_seconds": (server - midpoint).total_seconds(),
+                "round_trip_seconds": (after - before).total_seconds(),
+            }
+            self.archive.complete(record, payload, rows=1)
+            return payload
+        except Exception as exc:
+            self.archive.fail(record, f"{type(exc).__name__}: {exc}")
+            raise
 
     def qualify_stock(self, symbol: str) -> Any:
         """Resolve to a unique contract before requesting anything about it."""
-        ib = self._require()
-        candidates = ib.qualifyContracts(Stock(symbol, "SMART", "USD"))
-        if not candidates:
-            raise LookupError(f"TWS could not qualify a unique US contract for {symbol}")
-        contract = candidates[0]
-        self.log.record(
-            event="qualify",
-            symbol=symbol,
-            con_id=contract.conId,
-            primary_exchange=contract.primaryExchange,
-            resolved=len(candidates),
+        record = self.archive.begin(
+            "qualifyContracts", contract={"symbol": symbol, "sec_type": "STK", "currency": "USD"}
         )
-        return contract
+        try:
+            ib = self._require()
+            candidates = ib.qualifyContracts(Stock(symbol, "SMART", "USD"))
+            if not candidates:
+                raise LookupError(f"TWS could not qualify a unique US contract for {symbol}")
+            contract = candidates[0]
+            self.archive.complete(
+                record,
+                {"resolved": [_contract_identity(c) for c in candidates]},
+                rows=len(candidates),
+            )
+            return contract
+        except Exception as exc:
+            self.archive.fail(record, f"{type(exc).__name__}: {exc}")
+            raise
 
     def quotes(
         self,
@@ -226,13 +332,22 @@ class ReadOnlyIBKRClient:
         screen can lean on, and it arrives late or not at all, which is why the
         absent case is kept distinct from a genuine zero.
         """
-        ib = self._require()
         if generic_ticks is None:
             generic_ticks = (
                 "100,101,106"
                 if any(getattr(c, "secType", "") == "OPT" for c in contracts)
                 else ""
             )
+        record = self.archive.begin(
+            "reqMktData",
+            contract=[_contract_identity(c) for c in contracts],
+            parameters={
+                "genericTicks": generic_ticks,
+                "wait_seconds": wait_seconds,
+                "marketDataType": self.settings.market_data_type,
+            },
+        )
+        ib = self._require()
         tickers = [ib.reqMktData(c, generic_ticks, False, False) for c in contracts]
         try:
             ib.sleep(wait_seconds)
@@ -241,13 +356,7 @@ class ReadOnlyIBKRClient:
         finally:
             for contract in contracts:
                 ib.cancelMktData(contract)
-        self.log.record(
-            event="quotes",
-            requested=len(contracts),
-            returned=len(rows),
-            generic_ticks=generic_ticks,
-            wait_seconds=wait_seconds,
-        )
+        self.archive.complete(record, rows, rows=len(rows))
         return pd.DataFrame(rows)
 
     def _quote_row(self, ticker: Any, received: datetime) -> dict[str, Any]:
@@ -344,6 +453,17 @@ class ReadOnlyIBKRClient:
             raise PermissionError(
                 "Historical reads require IBKR_ALLOW_HISTORICAL=1 and an existing entitlement"
             )
+        record = self.archive.begin(
+            "reqHistoricalData",
+            contract=_contract_identity(contract),
+            parameters={
+                "durationStr": duration,
+                "barSizeSetting": "1 day",
+                "whatToShow": what_to_show,
+                "useRTH": use_rth,
+                "formatDate": 2,
+            },
+        )
         ib = self._require()
         bars = ib.reqHistoricalData(
             contract,
@@ -382,20 +502,29 @@ class ReadOnlyIBKRClient:
                 "retrieved_at_utc": datetime.now(timezone.utc).isoformat(),
             }
         )
-        self.log.record(
-            event="historical",
-            symbol=contract.symbol,
-            con_id=contract.conId,
-            what_to_show=what_to_show,
-            use_rth=use_rth,
-            duration=duration,
-            rows=len(frame),
-        )
+        raw_bars = [
+            {
+                "date": bar.date,
+                "open": bar.open,
+                "high": bar.high,
+                "low": bar.low,
+                "close": bar.close,
+                "volume": getattr(bar, "volume", None),
+                "bar_count": getattr(bar, "barCount", None),
+            }
+            for bar in bars
+        ]
+        self.archive.complete(record, raw_bars, rows=len(bars))
         return frame
 
     def option_parameters(self, contract: Any) -> pd.DataFrame:
         """Available expiries and strikes per exchange. Not every combination is a
         real contract - each candidate still has to be qualified."""
+        record = self.archive.begin(
+            "reqSecDefOptParams",
+            contract={"symbol": contract.symbol, "sec_type": contract.secType,
+                      "con_id": contract.conId},
+        )
         ib = self._require()
         params = ib.reqSecDefOptParams(
             contract.symbol, "", contract.secType, contract.conId
@@ -412,7 +541,7 @@ class ReadOnlyIBKRClient:
             }
             for p in params
         ]
-        self.log.record(event="option_params", symbol=contract.symbol, chains=len(rows))
+        self.archive.complete(record, rows, rows=len(rows))
         return pd.DataFrame(rows)
 
     def listed_strikes(
@@ -437,6 +566,11 @@ class ReadOnlyIBKRClient:
         expiry. It reads contract definitions, not market data, so it works
         without any quote subscription.
         """
+        record = self.archive.begin(
+            "reqContractDetails",
+            contract={"symbol": symbol, "expiry": expiry, "right": right,
+                      "exchange": exchange, "trading_class": trading_class or symbol},
+        )
         ib = self._require()
         blank = Option(
             symbol,
@@ -451,14 +585,7 @@ class ReadOnlyIBKRClient:
         strikes = sorted(
             {float(d.contract.strike) for d in details if getattr(d.contract, "strike", 0)}
         )
-        self.log.record(
-            event="listed_strikes",
-            symbol=symbol,
-            expiry=expiry,
-            right=right,
-            trading_class=trading_class or symbol,
-            strikes=len(strikes),
-        )
+        self.archive.complete(record, {"strikes": strikes}, rows=len(strikes))
         return strikes
 
     def qualify_options(
@@ -477,19 +604,22 @@ class ReadOnlyIBKRClient:
         only way to tell a coherent quote set from a plausible-looking one
         without a second data source.
         """
+        record = self.archive.begin(
+            "qualifyContracts",
+            contract={"symbol": symbol, "expiry": expiry, "right": right,
+                      "strikes": strikes, "exchange": exchange,
+                      "trading_class": trading_class or symbol},
+        )
         ib = self._require()
         wanted = [
             Option(symbol, expiry, strike, right, exchange, tradingClass=trading_class or symbol)
             for strike in strikes
         ]
         qualified = [c for c in ib.qualifyContracts(*wanted) if getattr(c, "conId", 0)]
-        self.log.record(
-            event="qualify_options",
-            symbol=symbol,
-            expiry=expiry,
-            right=right,
-            requested=len(wanted),
-            qualified=len(qualified),
+        self.archive.complete(
+            record,
+            {"requested_strikes": strikes, "qualified": [_contract_identity(c) for c in qualified]},
+            rows=len(qualified),
         )
         return qualified
 
@@ -507,8 +637,20 @@ class ReadOnlyIBKRClient:
         )
 
     @property
+    def records(self) -> list[RequestRecord]:
+        """The RequestRecords this connection produced, for the snapshot manifest.
+
+        The manifest is what links a snapshot back to its raw payloads, and it
+        stores the records themselves, not their DataFrame transcription.
+        """
+        return list(self.archive.records) if self.archive is not None else []
+
+    @property
     def request_log(self) -> pd.DataFrame:
-        return self.log.frame()
+        """The records this connection produced, newest first is a caller concern."""
+        if self.archive is None:
+            return pd.DataFrame()
+        return self.archive.frame()
 
 
 def _finite(value: Any) -> bool:

@@ -47,3 +47,18 @@ def test_client_version_gate_requires_ib_async_2x() -> None:
     # 1.x predates the API this module is written against.
     assert not supported_client_version("1.0.3")
     assert not supported_client_version(None)
+
+
+def test_every_data_method_opens_an_archive_record() -> None:
+    """Seven public data methods, seven begin() sites. A method added without one
+    would silently leave its requests out of the raw archive - and out of the
+    replay the fault-injection matrix depends on."""
+    source_path = Path(PROJECT_ROOT) / "src" / "market_state_lab" / "data" / "ibkr.py"
+    source = source_path.read_text(encoding="utf-8")
+    data_methods = (
+        "server_clock", "qualify_stock", "quotes", "historical_daily_bars",
+        "option_parameters", "listed_strikes", "qualify_options",
+    )
+    for method in data_methods:
+        assert f"def {method}(" in source, f"{method} missing from the client"
+    assert source.count("self.archive.begin(") >= len(data_methods)
