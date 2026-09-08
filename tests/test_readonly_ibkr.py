@@ -3,7 +3,7 @@ from pathlib import Path
 import pytest
 
 from market_state_lab.config import PROJECT_ROOT, load_config
-from market_state_lab.data.ibkr import ReadOnlyIBKRClient, supported_ibapi_version
+from market_state_lab.data.ibkr import ReadOnlyIBKRClient, supported_client_version
 
 
 def test_ibkr_configuration_is_opt_in_and_read_only() -> None:
@@ -42,7 +42,8 @@ def test_ibkr_module_contains_no_trading_calls() -> None:
     assert not [token for token in forbidden if token in source]
 
 
-def test_ibkr_version_gate_rejects_old_pypi_build() -> None:
-    assert supported_ibapi_version("10.50.1")
-    assert not supported_ibapi_version("9.81.1.post1")
-    assert not supported_ibapi_version(None)
+def test_client_version_gate_requires_ib_async_2x() -> None:
+    assert supported_client_version("2.1.0")
+    # 1.x predates the API this module is written against.
+    assert not supported_client_version("1.0.3")
+    assert not supported_client_version(None)

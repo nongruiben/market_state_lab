@@ -24,7 +24,9 @@ dependencies = [
 [project.optional-dependencies]
 research = ["jupyterlab>=4.2", "ipykernel>=6.29"]
 dev = ["pytest>=8.2", "pytest-cov>=5", "ruff>=0.6"]
-news = ["ib-async>=2.0", "ib-insync>=0.9.86"]
+# ib_insync is unmaintained; ib_async is the community continuation. Keeping
+# both installed invites importing the wrong one.
+news = ["ib-async>=2.0"]
 
 [project.scripts]
 market-state = "market_state_lab.cli:main"

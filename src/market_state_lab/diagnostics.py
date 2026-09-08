@@ -3,13 +3,12 @@ from __future__ import annotations
 import importlib.util
 import os
 import socket
-from importlib import metadata
 from typing import Any
 
 import pandas as pd
 
 from market_state_lab.config import PROJECT_ROOT
-from market_state_lab.data.ibkr import supported_ibapi_version
+from market_state_lab.data.ibkr import installed_client_version, supported_client_version
 
 
 def run_diagnostics(config: dict[str, Any]) -> pd.DataFrame:
@@ -20,17 +19,19 @@ def run_diagnostics(config: dict[str, Any]) -> pd.DataFrame:
     ):
         installed = importlib.util.find_spec(package) is not None
         rows.append({"check": f"dependency:{package}", "status": "ok" if installed else "failed", "detail": ""})
-    try:
-        ibapi_version = metadata.version("ibapi")
-    except metadata.PackageNotFoundError:
-        ibapi_version = None
-    ibapi_status = "ok" if supported_ibapi_version(ibapi_version) else "warning"
-    ibapi_detail = (
-        f"official API version {ibapi_version}"
-        if ibapi_status == "ok"
-        else "optional for public runs; install official IBKR API 10.x with install_ibkr_api.ps1"
+    client_version = installed_client_version()
+    client_ok = supported_client_version(client_version)
+    rows.append(
+        {
+            "check": "dependency:ib_async",
+            "status": "ok" if client_ok else "warning",
+            "detail": (
+                f"ib_async {client_version}"
+                if client_ok
+                else "optional for public runs; pip install 'ib-async>=2.0' to enable TWS reads"
+            ),
+        }
     )
-    rows.append({"check": "dependency:ibapi", "status": ibapi_status, "detail": ibapi_detail})
 
     readonly = bool(config.get("ibkr", {}).get("readonly_required"))
     enabled = bool(config.get("ibkr", {}).get("enabled", True))
