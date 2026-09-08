@@ -10,6 +10,14 @@ with 2 and 2. Taking the first row - or filtering on exchange alone - silently
 picks the wrong universe, so `select_chain` matches the trading class to the
 symbol and then takes the widest remaining row.
 
+A strike drawn from the chain is a *proposal*, never a contract. The strike
+list in `reqSecDefOptParams` is the union across every expiry, and the grid is
+not uniform - SPY's 31-day expiry lists 1-point strikes around the money while
+its 73-day expiry lists only 5-point ones, so a strike that is real for one is
+absent for the other. `plan_candidates` therefore marks its rows `proposed`, and
+only `resolve_strikes`, fed the strikes each expiry actually lists, can promote a
+row to `ok`. Nothing unresolved is ever quotable.
+
 Expiry buckets are a *comparison range*, not a recommendation. Nothing here
 decides that protection is worth buying, or which horizon a person should want;
 it produces a small set of alternatives that later get priced side by side.
@@ -123,10 +131,14 @@ def plan_candidates(
 ) -> pd.DataFrame:
     """The contracts to qualify and quote, with every rejection recorded.
 
-    `max_strike_drift` guards a thin chain: if the nearest listed strike sits
-    further from the target than this, the row is kept but marked, because a
-    "-5% put" that is really -8% would otherwise be compared as if it were the
-    protection that was asked for.
+    Rows come back `proposed`, not `ok`: the strike is drawn from the chain's
+    union across expiries, so it may name a contract this particular expiry does
+    not list. `resolve_strikes` is what confirms it.
+
+    `max_strike_drift` guards a thin chain: if the nearest strike sits further
+    from the target than this, the row is kept but marked, because a "-5% put"
+    that is really -8% would otherwise be compared as if it were the protection
+    that was asked for.
     """
     if not spot or spot <= 0:
         raise ValueError(f"{symbol}: need a positive spot to compute strikes")
@@ -162,7 +174,10 @@ def plan_candidates(
                     "strike": strike,
                     "actual_moneyness": strike / spot - 1.0,
                     "strike_drift": drift,
-                    "status": "ok" if drift <= max_strike_drift else "strike_far_from_target",
+                    "strike_source": "chain_union",
+                    "status": (
+                        "proposed" if drift <= max_strike_drift else "strike_far_from_target"
+                    ),
                 }
             )
     frame = pd.DataFrame(rows)
@@ -170,8 +185,61 @@ def plan_candidates(
     return frame
 
 
+def resolve_strikes(
+    candidates: pd.DataFrame,
+    listed: dict[str, list[float]],
+    max_strike_drift: float = 0.01,
+) -> pd.DataFrame:
+    """Move each proposed strike onto the grid its expiry actually lists.
+
+    `listed` maps expiry to the strikes confirmed by contract definitions - free
+    to fetch, and the only authority on what exists. The proposal is kept beside
+    the resolved strike rather than overwritten, because the gap between them is
+    how a thinning grid shows up: a target that resolves 5 points away on a
+    73-day expiry is a different instrument from the one the plan named.
+    """
+    if candidates.empty:
+        return candidates
+    rows: list[dict[str, Any]] = []
+    for row in candidates.to_dict("records"):
+        if row.get("status") not in {"proposed", "strike_far_from_target"}:
+            rows.append(row)
+            continue
+        target = row["target_strike"]
+        # Recovered from the row itself, so the result never depends on attrs
+        # surviving a concat or a round trip through disk.
+        spot = target / (1.0 + row["target_moneyness"])
+        real = listed.get(str(row["expiry"]))
+        row = {**row, "strike_proposed": row.get("strike"), "strike_source": "contract_details"}
+        if not real:
+            rows.append({**row, "strike": None, "status": "expiry_not_listed"})
+            continue
+        strike = nearest_strike(list(real), target)
+        if strike is None:
+            rows.append({**row, "strike": None, "status": "no_listed_strike"})
+            continue
+        drift = abs(strike / target - 1.0)
+        rows.append(
+            {
+                **row,
+                "strike": strike,
+                "actual_moneyness": strike / spot - 1.0,
+                "strike_drift": drift,
+                "status": "ok" if drift <= max_strike_drift else "strike_far_from_target",
+            }
+        )
+    resolved = pd.DataFrame(rows)
+    resolved.attrs.update(candidates.attrs)
+    return resolved
+
+
 def quotable(candidates: pd.DataFrame) -> pd.DataFrame:
-    """The subset worth spending a quote request on."""
+    """The subset worth spending a quote request on.
+
+    Only `resolve_strikes` sets `ok`, so an unresolved plan yields nothing here.
+    That is the point: a quote must never be spent on a contract whose existence
+    has not been confirmed.
+    """
     if candidates.empty:
         return candidates
     return candidates.loc[candidates["status"].eq("ok")].reset_index(drop=True)

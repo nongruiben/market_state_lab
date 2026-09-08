@@ -335,6 +335,52 @@ class ReadOnlyIBKRClient:
         self.log.record(event="option_params", symbol=contract.symbol, chains=len(rows))
         return pd.DataFrame(rows)
 
+    def listed_strikes(
+        self,
+        symbol: str,
+        expiry: str,
+        right: str = "P",
+        trading_class: str | None = None,
+        exchange: str = "SMART",
+        currency: str = "USD",
+    ) -> list[float]:
+        """The strikes actually listed for one expiry.
+
+        `reqSecDefOptParams` returns the union of strikes across every expiry in
+        a trading class, and that grid is not uniform: SPY's 31-day expiry
+        carries 1-point strikes around the money while its 73-day expiry carries
+        only 5-point ones. A strike taken from the union therefore names
+        contracts that do not exist - 20261120 P732 came back "no security
+        definition" while 20261009 P732 qualified fine.
+
+        One `reqContractDetails` with the strike left unset settles it per
+        expiry. It reads contract definitions, not market data, so it works
+        without any quote subscription.
+        """
+        ib = self._require()
+        blank = Option(
+            symbol,
+            expiry,
+            0,
+            right,
+            exchange,
+            tradingClass=trading_class or symbol,
+            currency=currency,
+        )
+        details = ib.reqContractDetails(blank)
+        strikes = sorted(
+            {float(d.contract.strike) for d in details if getattr(d.contract, "strike", 0)}
+        )
+        self.log.record(
+            event="listed_strikes",
+            symbol=symbol,
+            expiry=expiry,
+            right=right,
+            trading_class=trading_class or symbol,
+            strikes=len(strikes),
+        )
+        return strikes
+
     def qualify_puts(
         self,
         symbol: str,
