@@ -189,8 +189,14 @@ def summarise_candidate(frame: pd.DataFrame) -> dict[str, Any]:
     attrs = frame.attrs
     worst = frame.loc[frame["move"].idxmin()]
     flat = frame.loc[frame["move"].abs().idxmin()]
+    best = frame.loc[frame["move"].idxmax()]
     # Where the put finishes worthless, the hedge has cost exactly its premium.
     return {
+        # Same keys as summarise_control, so candidates and the do-nothing and
+        # de-risk controls can be read down one table instead of three.
+        "label": f"put {attrs['strike']:g} {attrs['expiry']}",
+        "structure": "long put",
+        "pnl_at_best_move": float(best["hedged_pnl"]),
         "symbol": attrs["symbol"],
         "expiry": attrs["expiry"],
         "strike": attrs["strike"],
@@ -205,6 +211,176 @@ def summarise_candidate(frame: pd.DataFrame) -> dict[str, Any]:
         "unhedged_pnl_at_worst_move": float(worst["unhedged_pnl"]),
         "protection_at_worst_move": float(worst["protection_vs_unhedged"]),
         "pnl_if_flat": float(flat["hedged_pnl"]),
+        # Plan 10.3: what the protection actually covers, and what it does not.
+        # Below the strike the puts pay one-for-one on the shares they cover;
+        # between spot and strike nothing pays, and the shares whole contracts
+        # could not cover are never protected at any price.
+        "protected_below": attrs["strike"],
+        "unprotected_drop_pct": attrs["strike"] / attrs["spot"] - 1.0,
+        "uncovered_shares": attrs["uncovered_shares"],
+        "maintenance": "none until expiry; the payoff is fixed by the contract",
+        "review_when": f"expiry {attrs['expiry']}, or a spot move through {attrs['strike']:g}",
         "quote_age_seconds": attrs["quote_age_seconds"],
         "market_data_type": attrs["market_data_type"],
+    }
+
+
+def _control_frame(
+    exposure: ReferenceExposure,
+    label: str,
+    rows: list[dict[str, Any]],
+    cost: float,
+    attrs: dict[str, Any],
+) -> pd.DataFrame:
+    frame = pd.DataFrame(rows)
+    frame.attrs.update(
+        {
+            "label": label,
+            "symbol": exposure.symbol,
+            "spot": exposure.spot,
+            "reference_notional_usd": exposure.notional_usd,
+            "premium_and_fees": cost,
+            "premium_pct_of_notional": cost / exposure.notional_usd,
+            **attrs,
+        }
+    )
+    return frame
+
+
+def no_protection_scenarios(
+    exposure: ReferenceExposure,
+    moves: tuple[float, ...] = DEFAULT_MOVE_GRID,
+) -> pd.DataFrame:
+    """The reference exposure carried as it is.
+
+    The control that must appear beside every candidate. Without it a table of
+    six puts reads as "pick one of these", when the honest first question is
+    whether to buy protection at all.
+    """
+    rows: list[dict[str, Any]] = []
+    for move in moves:
+        terminal = exposure.spot * (1.0 + move)
+        value = exposure.shares * terminal
+        rows.append(
+            {
+                "move": move,
+                "terminal_price": terminal,
+                "unhedged_value": value,
+                "put_payoff": 0.0,
+                "premium_and_fees": 0.0,
+                "hedged_value": value,
+                "unhedged_pnl": value - exposure.notional_usd,
+                "hedged_pnl": value - exposure.notional_usd,
+                "protection_vs_unhedged": 0.0,
+            }
+        )
+    return _control_frame(exposure, "no new protection", rows, 0.0, {"structure": "unhedged"})
+
+
+def reduced_exposure_scenarios(
+    exposure: ReferenceExposure,
+    moves: tuple[float, ...] = DEFAULT_MOVE_GRID,
+    reduce_to: float = 0.8,
+    horizon_days: int = 30,
+    cash_rate: float = 0.0,
+    exit_cost_bps: float = 2.0,
+) -> pd.DataFrame:
+    """Sell down to `reduce_to` of the reference exposure and hold the rest in cash.
+
+    The other way to carry less downside, and the one a put has to be worth more
+    than. It is not free: the sale pays a spread, and giving up the position
+    gives up its upside too, which the +5% and +10% rows are there to show.
+
+    `cash_rate` defaults to zero and that understates this control - the cash
+    really would earn something. It is a flag rather than a guess because
+    inventing a rate here would quietly flatter the puts.
+    """
+    if not 0.0 <= reduce_to <= 1.0:
+        raise ValueError("reduce_to must be a fraction of the reference exposure")
+    sold_notional = exposure.notional_usd * (1.0 - reduce_to)
+    exit_cost = sold_notional * exit_cost_bps / 10_000.0
+    cash = sold_notional - exit_cost
+    carry = cash * cash_rate * horizon_days / 365.0
+    kept_shares = exposure.shares * reduce_to
+
+    rows: list[dict[str, Any]] = []
+    for move in moves:
+        terminal = exposure.spot * (1.0 + move)
+        unhedged = exposure.shares * terminal
+        value = kept_shares * terminal + cash + carry
+        rows.append(
+            {
+                "move": move,
+                "terminal_price": terminal,
+                "unhedged_value": unhedged,
+                "put_payoff": 0.0,
+                "premium_and_fees": exit_cost,
+                "hedged_value": value,
+                "unhedged_pnl": unhedged - exposure.notional_usd,
+                "hedged_pnl": value - exposure.notional_usd,
+                "protection_vs_unhedged": value - unhedged,
+            }
+        )
+    return _control_frame(
+        exposure,
+        f"reduce to {reduce_to:.0%}",
+        rows,
+        exit_cost,
+        {
+            "structure": "de-risked",
+            "reduce_to": reduce_to,
+            "cash_usd": cash,
+            "cash_rate": cash_rate,
+            "cash_carry_usd": carry,
+            "horizon_days": horizon_days,
+        },
+    )
+
+
+def summarise_control(frame: pd.DataFrame) -> dict[str, Any]:
+    """A control shaped like a candidate, so one table can hold both."""
+    attrs = frame.attrs
+    worst = frame.loc[frame["move"].idxmin()]
+    flat = frame.loc[frame["move"].abs().idxmin()]
+    best = frame.loc[frame["move"].idxmax()]
+    return {
+        "label": attrs["label"],
+        "symbol": attrs["symbol"],
+        "structure": attrs["structure"],
+        "expiry": None,
+        "strike": None,
+        "moneyness": None,
+        "contracts": None,
+        # Neither control buys coverage. Owning less is not the same as being
+        # covered: it removes the exposure instead of insuring it, and the
+        # +5%/+10% rows are where that difference shows up.
+        "coverage_ratio": 0.0,
+        "ask": None,
+        "spread": None,
+        "cost_usd": attrs["premium_and_fees"],
+        "cost_pct_of_notional": attrs["premium_pct_of_notional"],
+        "pnl_if_flat": float(flat["hedged_pnl"]),
+        "pnl_at_best_move": float(best["hedged_pnl"]),
+        "unhedged_pnl_at_worst_move": float(worst["unhedged_pnl"]),
+        "pnl_at_worst_move": float(worst["hedged_pnl"]),
+        "protection_at_worst_move": float(worst["protection_vs_unhedged"]),
+        # A control has no strike, so it protects nothing below a level; the
+        # de-risked one simply owns less. The maintenance line is where the two
+        # really differ from a put: a put ends itself on a known date, while a
+        # decision to hold less stays open until someone reverses it.
+        "protected_below": None,
+        "unprotected_drop_pct": None,
+        "uncovered_shares": None,
+        "maintenance": (
+            "none; nothing was bought"
+            if attrs["structure"] == "unhedged"
+            else "open-ended; the cash has no expiry and re-entry is a further decision"
+        ),
+        "review_when": (
+            "no expiry sets a date; the decision stays open"
+            if attrs["structure"] == "unhedged"
+            else "no expiry sets a date; re-entry timing is an unmade decision"
+        ),
+        "quote_age_seconds": None,
+        "market_data_type": None,
     }

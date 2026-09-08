@@ -77,6 +77,8 @@ def put_call_parity_check(
             "implied_forward": None,
             "max_abs_residual": None,
             "worst_residual_tolerance": None,
+            "implied_rate_stderr": None,
+            "strike_span": None,
             "status": "insufficient_pairs",
         }
         if not {"C", "P"}.issubset(mids.columns):
@@ -92,11 +94,28 @@ def put_call_parity_check(
         basis = (paired["C"] - paired["P"]).to_numpy(dtype=float)
         slope, intercept = (float(v) for v in np.polyfit(strikes, basis, 1))
         record["slope"] = slope
+        record["strike_span"] = float(strikes.max() - strikes.min())
+        days = days_to_expiry.get(expiry)
         if slope < 0:
             record["implied_forward"] = -intercept / slope
-            days = days_to_expiry.get(expiry)
             if days:
                 record["implied_rate"] = float(-np.log(-slope) / (days / 365.0))
+        # How much the rate is actually resolved. The slope is fitted over the
+        # strike span, so a narrow ladder pins it far more loosely than a wide
+        # one, and at a short maturity that uncertainty is divided by a small T.
+        # Reporting the rate without this invites reading 1.6% and -3.5% as two
+        # different facts when they are one number with a two-point error bar.
+        leverage = float(((strikes - strikes.mean()) ** 2).sum())
+        if len(paired) > 2 and leverage > 0 and days and slope < 0:
+            spread_of_fit = float(
+                np.sqrt(
+                    ((basis - (slope * strikes + intercept)) ** 2).sum() / (len(paired) - 2)
+                )
+            )
+            slope_stderr = spread_of_fit / np.sqrt(leverage)
+            record["implied_rate_stderr"] = float(
+                slope_stderr / (abs(slope) * days / 365.0)
+            )
 
         if not SLOPE_BAND[0] <= slope <= SLOPE_BAND[1]:
             # Not a pricing complaint. A slope this far off means the legs being

@@ -326,6 +326,10 @@ def attach_quotes(candidates: pd.DataFrame, quotes: pd.DataFrame) -> pd.DataFram
             "implied_volatility": quote.get("implied_volatility"),
             "delta": quote.get("delta"),
             "underlying_price": quote.get("underlying_price"),
+            "open_interest": quote.get("open_interest"),
+            "option_volume": quote.get("option_volume"),
+            "bid_size": quote.get("bid_size"),
+            "ask_size": quote.get("ask_size"),
         }
         # The ask is the only price a buyer of protection actually pays, so a
         # missing ask is fatal to the row even when a bid came through.
@@ -371,3 +375,184 @@ def put_quotes(candidates: pd.DataFrame) -> list[PutQuote]:
         )
         for row in priced.to_dict("records")
     ]
+
+
+@dataclass(frozen=True)
+class ScreenLimits:
+    """Hard constraints on a candidate, and the QA parameters behind them.
+
+    These are data-quality and liquidity limits, not a view on whether
+    protection is worth buying. The 60-second figure is the plan's first-version
+    QA parameter for a continuously trading session; it deliberately does not
+    apply to a frozen book, because a received-update age is not an exchange
+    trade age and reusing the number across regimes is how a four-day-old price
+    passes a freshness check.
+    """
+
+    max_quote_age_seconds: float = 60.0
+    max_relative_spread: float = 0.15
+    min_open_interest: int = 100
+    max_cost_pct_of_notional: float = 0.05
+
+
+VALID, DEGRADED, QUARANTINED, UNAVAILABLE = "VALID", "DEGRADED", "QUARANTINED", "UNAVAILABLE"
+USABLE_QUALIFICATIONS = (VALID, DEGRADED)
+
+
+def _qualify_quote(row: dict[str, Any], limits: ScreenLimits, regime: str) -> tuple[str, str]:
+    """One row's quote qualification, and the reason for it.
+
+    `regime` is how the book was timed: "frozen_closed" is a frozen book with
+    the market shut, which is the normal state of a post-close run; the same
+    book while the market trades is stale by definition, however recent the
+    tick that carried it.
+    """
+    if row.get("status") != "priced":
+        return UNAVAILABLE, f"not priced ({row.get('status')})"
+    if regime == "frozen_open":
+        return DEGRADED, "frozen book while the session is trading"
+    if regime == "frozen_closed":
+        return VALID, "frozen at the last close, which is the whole market right now"
+    age = row.get("quote_age_seconds")
+    if age is None or not pd.notna(age):
+        return DEGRADED, "no usable quote timestamp"
+    if float(age) > limits.max_quote_age_seconds:
+        return DEGRADED, f"quote age {float(age):.0f}s over the {limits.max_quote_age_seconds:.0f}s limit"
+    return VALID, f"quote age {float(age):.0f}s"
+
+
+def screen_candidates(
+    candidates: pd.DataFrame,
+    limits: ScreenLimits = ScreenLimits(),
+    quote_basis: str = "unknown",
+    market_open: bool = False,
+) -> pd.DataFrame:
+    """Hard constraints on the quote, before any payoff is computed.
+
+    Liquidity and price quality gate a candidate; cost does not, because cost is
+    the trade-off the reader is here to make and cannot be judged before the
+    contracts are sized.
+
+    Unknown is never silently a pass or a fail. An absent open interest marks
+    the row DEGRADED and says so, because the tick arrives late or not at all
+    and dropping a liquid contract over a missing tick is the same error as
+    admitting an illiquid one over a zero.
+    """
+    if candidates.empty:
+        return candidates
+    frozen = quote_basis in {"frozen_last_session", "mixed"}
+    regime = ("frozen_open" if market_open else "frozen_closed") if frozen else quote_basis
+
+    rows: list[dict[str, Any]] = []
+    for row in candidates.to_dict("records"):
+        qualification, why = _qualify_quote(row, limits, regime)
+        failures: list[str] = []
+        notes: list[str] = [why]
+
+        spread = row.get("relative_spread")
+        if spread is None or not pd.notna(spread):
+            if qualification in USABLE_QUALIFICATIONS:
+                qualification = DEGRADED
+            notes.append("no two-sided market, so the spread is unknown")
+        elif float(spread) > limits.max_relative_spread:
+            failures.append(
+                f"relative spread {float(spread):.1%} over {limits.max_relative_spread:.0%}"
+            )
+
+        interest = row.get("open_interest")
+        if interest is None or not pd.notna(interest):
+            if qualification in USABLE_QUALIFICATIONS:
+                qualification = DEGRADED
+            notes.append("open interest not returned; absent is not zero")
+        elif float(interest) < limits.min_open_interest:
+            failures.append(
+                f"open interest {float(interest):.0f} under {limits.min_open_interest}"
+            )
+
+        if failures and qualification in USABLE_QUALIFICATIONS:
+            qualification = QUARANTINED
+        rows.append(
+            {
+                **row,
+                "quote_qualification": qualification,
+                "screen_failures": "; ".join(failures) or None,
+                "screen_notes": "; ".join(notes),
+                "screened": qualification in USABLE_QUALIFICATIONS and not failures,
+            }
+        )
+    screened = pd.DataFrame(rows)
+    screened.attrs.update(candidates.attrs)
+    screened.attrs["screen_regime"] = regime
+    return screened
+
+
+def screened(candidates: pd.DataFrame) -> pd.DataFrame:
+    """The rows that cleared every hard constraint."""
+    if candidates.empty or "screened" not in candidates.columns:
+        return candidates.iloc[0:0]
+    return candidates.loc[candidates["screened"]].reset_index(drop=True)
+
+
+def shortlist(
+    summaries: pd.DataFrame,
+    limits: ScreenLimits = ScreenLimits(),
+    max_candidates: int = 3,
+    horizon: str | None = None,
+) -> pd.DataFrame:
+    """At most three candidates spanning different trade-offs. No score, no rank.
+
+    The three slots are the three protection depths, because that is the real
+    trade-off: a shallower strike starts paying sooner and costs more. Picking
+    them by a weighted total would decide the reader's preference for them and
+    call it an optimum.
+
+    One horizon at a time, since a depth and a term are two different questions
+    and three rows cannot answer both. The full screened table is where the
+    horizons are compared; this is the short list within the chosen one.
+
+    Cost is a hard limit here rather than in `screen_candidates`, because it
+    cannot be judged before the contracts are sized.
+    """
+    if summaries.empty:
+        return summaries
+    rows: list[dict[str, Any]] = []
+    for row in summaries.to_dict("records"):
+        cost = row.get("cost_pct_of_notional")
+        if cost is not None and pd.notna(cost) and float(cost) > limits.max_cost_pct_of_notional:
+            rows.append(
+                {
+                    **row,
+                    "shortlisted": False,
+                    "shortlist_reason": (
+                        f"cost {float(cost):.2%} over the "
+                        f"{limits.max_cost_pct_of_notional:.0%} limit"
+                    ),
+                }
+            )
+            continue
+        rows.append({**row, "shortlisted": False, "shortlist_reason": "not in the chosen horizon"})
+    frame = pd.DataFrame(rows)
+
+    affordable = frame.loc[frame["shortlist_reason"].eq("not in the chosen horizon")]
+    if affordable.empty:
+        return frame
+    buckets = [b for b in affordable["bucket"].dropna().unique()]
+    chosen = horizon if horizon in buckets else (buckets[0] if buckets else None)
+    if chosen is None:
+        return frame
+
+    taken = 0
+    seen: set[float] = set()
+    for idx, row in affordable.loc[affordable["bucket"].eq(chosen)].sort_values(
+        "target_moneyness", ascending=False
+    ).iterrows():
+        depth = float(row["target_moneyness"])
+        if depth in seen or taken >= max_candidates:
+            continue
+        seen.add(depth)
+        taken += 1
+        frame.loc[idx, "shortlisted"] = True
+        frame.loc[idx, "shortlist_reason"] = f"{depth:.0%} protection depth in {chosen}"
+    frame.attrs.update(summaries.attrs)
+    frame.attrs["shortlist_horizon"] = chosen
+    return frame

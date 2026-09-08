@@ -54,6 +54,21 @@ def last_completed_session(
     raise RuntimeError(f"No completed {calendar_name} session before {now_utc.isoformat()}")
 
 
+def market_is_open(
+    calendar_name: str = "XNYS",
+    now: datetime | pd.Timestamp | None = None,
+) -> bool:
+    """Is a regular session trading right now?
+
+    A frozen book is the normal state of a post-close run and a problem during
+    one: the same stale prices mean "the last thing the market said" after the
+    bell and "you are looking at yesterday" while it trades.
+    """
+    now_utc = as_utc(now)
+    calendar = xcals.get_calendar(calendar_name)
+    return bool(calendar.is_open_on_minute(now_utc.floor("min")))
+
+
 def completed_market_clock(
     config: dict[str, Any],
     now: datetime | pd.Timestamp | None = None,

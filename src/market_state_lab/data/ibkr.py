@@ -220,15 +220,18 @@ class ReadOnlyIBKRClient:
         cancelled on the way out either way - a market-data line left open is a
         real leak against a capped allowance.
 
-        `generic_ticks` defaults to 106 (model greeks) when any contract is an
-        option. Implied vol and the underlying price TWS priced against are what
-        make a quote interpretable afterwards; they are recorded here, never used
-        to value anything.
+        `generic_ticks` defaults to option volume (100), open interest (101) and
+        model greeks (106) when any contract is an option. All three are recorded
+        and none is used to value anything; open interest is the one a liquidity
+        screen can lean on, and it arrives late or not at all, which is why the
+        absent case is kept distinct from a genuine zero.
         """
         ib = self._require()
         if generic_ticks is None:
             generic_ticks = (
-                "106" if any(getattr(c, "secType", "") == "OPT" for c in contracts) else ""
+                "100,101,106"
+                if any(getattr(c, "secType", "") == "OPT" for c in contracts)
+                else ""
             )
         tickers = [ib.reqMktData(c, generic_ticks, False, False) for c in contracts]
         try:
@@ -257,6 +260,17 @@ class ReadOnlyIBKRClient:
         has_two_sided = _finite(ticker.bid) and _finite(ticker.ask)
         has_any = has_two_sided or _finite(ticker.last) or _finite(getattr(ticker, "close", None))
         greeks = getattr(ticker, "modelGreeks", None)
+        # Open interest is right-specific and IB fills the opposite side with a
+        # zero rather than leaving it out, so reading the wrong field turns a
+        # liquid contract into an empty one. A put's callOpenInterest is 0 by
+        # construction, not a fact about the market.
+        right = getattr(contract, "right", "") or ""
+        if right == "P":
+            open_interest, option_volume = ticker.putOpenInterest, ticker.putVolume
+        elif right == "C":
+            open_interest, option_volume = ticker.callOpenInterest, ticker.callVolume
+        else:
+            open_interest, option_volume = getattr(ticker, "openInterest", None), None
         return {
             "symbol": contract.symbol,
             "con_id": contract.conId,
@@ -306,6 +320,11 @@ class ReadOnlyIBKRClient:
             "implied_volatility": _clean(getattr(greeks, "impliedVol", None)),
             "delta": getattr(greeks, "delta", None) if greeks else None,
             "underlying_price": _clean(getattr(greeks, "undPrice", None)),
+            # Best-effort. Open interest is end-of-day and often arrives after
+            # the quote or not at all; `None` means the tick never came, which a
+            # screen must treat differently from a contract nobody holds.
+            "open_interest": _clean(open_interest),
+            "option_volume": _clean(option_volume),
         }
 
     def historical_daily_bars(

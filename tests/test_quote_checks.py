@@ -198,3 +198,29 @@ def test_one_frozen_leg_makes_the_whole_set_mixed() -> None:
 
 def test_no_quotes_has_no_age_to_report() -> None:
     assert staleness_note(pd.DataFrame())["basis"] == "unknown"
+
+
+def test_a_narrow_strike_ladder_pins_the_rate_far_more_loosely() -> None:
+    # Same residual, same maturity; only the lever arm differs. The rate is not
+    # measured any better by wishing, and the error bar has to say so.
+    wide = put_call_parity_check(
+        _chain("20261009", [695.0, 725.0, 755.0], forward=770.7, rate=0.02,
+               put_nudge={725.0: 0.05}),
+        DAYS,
+    ).iloc[0]
+    narrow = put_call_parity_check(
+        _chain("20261009", [740.0, 747.0, 755.0], forward=770.7, rate=0.02,
+               put_nudge={747.0: 0.05}),
+        DAYS,
+    ).iloc[0]
+    assert narrow["strike_span"] < wide["strike_span"]
+    assert narrow["implied_rate_stderr"] > wide["implied_rate_stderr"]
+    # A 31-day fit on a 15-point ladder cannot resolve a rate to a percent.
+    assert narrow["implied_rate_stderr"] > 0.01
+
+
+def test_two_pairs_have_no_residual_left_to_estimate_error_from() -> None:
+    check = put_call_parity_check(
+        _chain("20261009", [695.0, 755.0], forward=770.7, rate=0.02), DAYS
+    ).iloc[0]
+    assert check["implied_rate_stderr"] is None
