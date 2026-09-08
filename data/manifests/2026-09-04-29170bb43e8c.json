@@ -1,0 +1,39 @@
+{
+  "contract_version": "2",
+  "snapshot_id": "2026-09-04-29170bb43e8c",
+  "session_date": "2026-09-04",
+  "revision": 1,
+  "supersedes": null,
+  "changed_tables": null,
+  "written_at_utc": "2026-09-08T10:38:53.836001+00:00",
+  "config_sha256": "58509d9507a9918bcf76b09c83d64abc9b2749bc331b015bc11d9ec06be78c5b",
+  "code_sha256": "3d777b504b013c93aa9559cfc9bdbc93031fbe2289e027720731cbde1c781b58",
+  "tables": {
+    "candidates": {
+      "rows": 6,
+      "sha256": "4bf4c820b5100ee27b1f99b4da6200c2e6a1b40ab322cb3c5ed6533352c2aac9"
+    },
+    "comparison": {
+      "rows": 6,
+      "sha256": "f6d5d28c1635dcc3f6d2a67b8fac63453539ccad0a9cb8f33e723e95d3fee678"
+    },
+    "parity": {
+      "rows": 2,
+      "sha256": "5aa4b0e371a3f07fbe7955dd8cdb427046ab4b99492e265f0d164b9d2946ff40"
+    },
+    "controls": {
+      "rows": 2,
+      "sha256": "66180241f2f838efdb15992d084d120336b965f04f331b2f60cf49180407366b"
+    }
+  },
+  "requests": [],
+  "quality_issues": [],
+  "eligible_for": [
+    "day_end_analysis",
+    "instrument_quotes"
+  ],
+  "ineligibility": {
+    "intraday_observation": "post-close run on a frozen book",
+    "training": "one session; a training set is granted over a series, not a run"
+  }
+}

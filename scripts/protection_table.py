@@ -38,6 +38,10 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from market_state_lab.config import load_config  # noqa: E402
 from market_state_lab.data.ibkr import ReadOnlyIBKRClient  # noqa: E402
+from market_state_lab.data.snapshots import (  # noqa: E402
+    latest_sessions,
+    write_snapshot,
+)
 from market_state_lab.defense_tools import (  # noqa: E402
     ScreenLimits,
     attach_contracts,
@@ -263,6 +267,89 @@ def report(result: dict[str, Any], args: argparse.Namespace) -> None:
                 print(f"  {row['label']:<24} {row['shortlist_reason']}")
 
 
+
+def store(results: list[dict[str, Any]], args: argparse.Namespace, config: dict) -> str | None:
+    """Write the run as an immutable snapshot, and say what it may be used for.
+
+    This is where the history comes from. TWS will not sell option quotes for
+    last week, so the only way to ever see how the cost of protection moved is
+    to keep each day as it happens - and to keep it in a form that says which
+    session it belongs to and how good it was, rather than a folder of files
+    named by the day someone happened to run the script.
+
+    Eligibility is granted here, not inherited from the data arriving. A book
+    frozen at the last close describes that close perfectly and is still not a
+    price anyone can trade against, so `instrument_quotes` needs every screened
+    row to have qualified VALID, and `training` is never granted by one run.
+    """
+    usable = [r for r in results if not r.get("error")]
+    if not usable:
+        return None
+
+    frames: dict[str, pd.DataFrame] = {}
+    for name, key in (("candidates", "plan"), ("comparison", "candidates"), ("parity", "parity")):
+        parts = [
+            r[key].assign(symbol=r["symbol"])
+            for r in usable
+            if isinstance(r.get(key), pd.DataFrame) and not r[key].empty
+        ]
+        if parts:
+            frames[name] = pd.concat(parts, ignore_index=True)
+    frames["controls"] = pd.DataFrame(
+        [{**c, "symbol": r["symbol"]} for r in usable for c in r["controls"]]
+    )
+    if not frames:
+        return None
+
+    sessions = {
+        r["staleness"].get("last_completed_session") for r in usable
+    } - {None}
+    session_date = sorted(sessions)[-1] if sessions else str(last_completed_session()[0].date())
+
+    # A single frozen post-close book: good enough to describe the session, and
+    # good enough to price a contract only if nothing was flagged on the way.
+    qualifications = set(frames.get("candidates", pd.DataFrame()).get(
+        "quote_qualification", pd.Series(dtype=str)
+    ))
+    all_valid = qualifications <= {"VALID"} and bool(qualifications)
+    eligible = ["day_end_analysis"] + (["instrument_quotes"] if all_valid else [])
+    ineligible = {
+        "intraday_observation": "post-close run on a frozen book",
+        "training": "one session; a training set is granted over a series, not a run",
+    }
+    if not all_valid:
+        ineligible["instrument_quotes"] = (
+            "not every screened row qualified VALID: "
+            + ", ".join(sorted(qualifications - {"VALID"}))
+        )
+
+    snapshot = write_snapshot(
+        ROOT / "data",
+        session_date,
+        frames,
+        config,
+        eligible_for=tuple(eligible),
+        ineligibility=ineligible,
+        project_root=ROOT,
+    )
+    revision = snapshot.manifest.get("revision", 1)
+    history = latest_sessions(ROOT / "data")
+    line = f"\nsnapshot {snapshot.snapshot_id} rev {revision}"
+    if snapshot.manifest.get("supersedes"):
+        # A fuller look at the same close supersedes the earlier one and says
+        # what moved. It never rewrites it: the first reading stays readable.
+        changed = ", ".join(snapshot.manifest.get("changed_tables") or []) or "nothing"
+        line += f", superseding {snapshot.manifest['supersedes']} (changed: {changed})"
+    print(
+        f"{line}  eligible_for={','.join(eligible)}"
+        f"\n  {len(history)} session(s) recorded"
+        f" ({history['session_date'].min()} to {history['session_date'].max()}),"
+        f" {int(history['revisions'].sum())} observation(s)"
+        " - the option-price history the feed will not sell is only ever kept forward"
+    )
+    return snapshot.snapshot_id
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--symbols", default="SPY,QQQ,IWM")
@@ -307,12 +394,15 @@ def main() -> int:
             "reference and a stated mapping,\nwhich this does not have."
         )
 
+    snapshot_id = store(results, args, config)
+
     out = ROOT / "reports" / "protection_table.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(
         json.dumps(
             {
                 "built_at_utc": datetime.now(timezone.utc).isoformat(),
+                "snapshot_id": snapshot_id,
                 "market_open": market_is_open(),
                 "reference_notional_usd": args.notional,
                 "horizon": args.horizon,
