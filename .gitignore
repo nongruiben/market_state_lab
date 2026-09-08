@@ -7,6 +7,12 @@ __pycache__/
 *.py[cod]
 data/raw/*
 data/processed/*
+# Run artefacts. Snapshots are the local record of sessions this machine
+# observed; they are the point of the archive and they are not source. Keeping
+# them out also keeps market data out of a public repo.
+data/validated/
+data/manifests/
+data/quarantine/
 reports/*
 models/*
 data/raw/news/
