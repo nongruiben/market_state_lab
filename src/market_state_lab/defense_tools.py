@@ -556,3 +556,20 @@ def shortlist(
     frame.attrs.update(summaries.attrs)
     frame.attrs["shortlist_horizon"] = chosen
     return frame
+
+
+def data_status(candidates: pd.DataFrame) -> str:
+    """Why is nothing quotable - the data never arrived, or the screen said no?
+
+    The distinction is the whole of fault-injection row 10. "No quotes arrived"
+    is DATA_INSUFFICIENT and must be printed as such: a comparison table that
+    shows only its controls in that state reads as "do nothing is the answer",
+    when the honest reading is "there is no answer today". "Everything priced
+    and then screened out" is data that worked, and the controls are a
+    legitimate comparison then.
+    """
+    if candidates.empty:
+        return "no_data"
+    if candidates["status"].eq("priced").any():
+        return "screened_out"
+    return "data_insufficient"

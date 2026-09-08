@@ -226,6 +226,35 @@ def build_snapshot_id(
     return f"{session_date}-{digest.hexdigest()[:12]}"
 
 
+def default_eligibility(qualifications: set[str] | None) -> tuple[tuple[str, ...], dict[str, str]]:
+    """What a post-close run may grant its snapshot, from the rows' qualifications.
+
+    The fault-injection matrix pins this: delayed or frozen data during a live
+    session must not enter a real-time instrument recommendation, and that fact
+    has to show up as an eligibility refusal rather than as a smaller table.
+    `instrument_quotes` is granted only when every screened row qualified VALID
+    - a single DEGRADED row, whatever the reason, demotes the whole snapshot,
+    because a comparison quietly missing one leg reads as "these are the
+    choices".
+
+    `training` is never granted by one run, and `intraday_observation` never by
+    a post-close one. Both are matters of series and schedule, not of data.
+    """
+    ineligible = {
+        "intraday_observation": "post-close run on a frozen book",
+        "training": "one session; a training set is granted over a series, not a run",
+    }
+    eligible: list[str] = ["day_end_analysis"]
+    if qualifications and qualifications <= {"VALID"}:
+        eligible.append("instrument_quotes")
+    else:
+        ineligible["instrument_quotes"] = (
+            "not every screened row qualified VALID: "
+            + (", ".join(sorted(qualifications - {"VALID"})) if qualifications else "no data")
+        )
+    return tuple(eligible), ineligible
+
+
 def write_snapshot(
     root: Path,
     session_date: str,

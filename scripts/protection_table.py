@@ -39,6 +39,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from market_state_lab.config import load_config  # noqa: E402
 from market_state_lab.data.ibkr import ReadOnlyIBKRClient  # noqa: E402
 from market_state_lab.data.snapshots import (  # noqa: E402
+    default_eligibility,
     latest_sessions,
     write_snapshot,
 )
@@ -46,6 +47,7 @@ from market_state_lab.defense_tools import (  # noqa: E402
     ScreenLimits,
     attach_contracts,
     attach_quotes,
+    data_status,
     plan_candidates,
     put_quotes,
     resolve_strikes,
@@ -238,6 +240,7 @@ def report(result: dict[str, Any], args: argparse.Namespace) -> None:
         return
 
     candidates = result["candidates"]
+    status = data_status(result["plan"])
     picked = (
         candidates.loc[candidates["shortlisted"]].to_dict("records")
         if not candidates.empty
@@ -255,6 +258,12 @@ def report(result: dict[str, Any], args: argparse.Namespace) -> None:
     )
     if candidates.empty:
         print("  no candidate cleared the screen; the controls are the whole table")
+    elif not candidates["shortlisted"].any() and status == "data_insufficient":
+        print(
+            "  DATA_INSUFFICIENT: quotes did not arrive, so nothing here is a\n"
+            "  recommendation to do nothing. A table showing only its controls\n"
+            "  must never read as one."
+        )
     print(table.reindex(columns=COMPARE_COLS).to_string(index=False))
     print()
     print(table.reindex(columns=DETAIL_COLS).to_string(index=False))
@@ -314,17 +323,7 @@ def store(
     qualifications = set(frames.get("candidates", pd.DataFrame()).get(
         "quote_qualification", pd.Series(dtype=str)
     ))
-    all_valid = qualifications <= {"VALID"} and bool(qualifications)
-    eligible = ["day_end_analysis"] + (["instrument_quotes"] if all_valid else [])
-    ineligible = {
-        "intraday_observation": "post-close run on a frozen book",
-        "training": "one session; a training set is granted over a series, not a run",
-    }
-    if not all_valid:
-        ineligible["instrument_quotes"] = (
-            "not every screened row qualified VALID: "
-            + ", ".join(sorted(qualifications - {"VALID"}))
-        )
+    eligible, ineligible = default_eligibility(qualifications)
 
     snapshot = write_snapshot(
         ROOT / "data",
