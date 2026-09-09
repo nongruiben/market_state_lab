@@ -185,3 +185,27 @@ def test_a_one_sided_market_gives_a_nan_spread_not_a_zero_bid() -> None:
     # A zero bid would make the spread read 6.45 - a liquidity claim nobody made.
     assert math.isnan(put.spread)
 
+
+
+def test_contract_identity_is_keyed_on_the_con_id() -> None:
+    """SPY's chain spans two trading classes, so symbol and strike do not name
+    a contract. The conId does, and the trading class is what reveals the rest."""
+    from market_state_lab.data.contracts import ContractIdentity, contract_identity
+
+    decoy = ContractIdentity(symbol="SPY", trading_class="2SPY")
+    assert not decoy.qualified
+    real = ContractIdentity(con_id=917830498, symbol="SPY", trading_class="SPY")
+    assert real.qualified
+    assert contract_identity(FakeContract(917830498, "20261009", 755.0))["con_id"] == 917830498
+
+
+def test_two_price_conventions_are_not_comparable() -> None:
+    from market_state_lab.data.contracts import RAW, TOTAL_RETURN, SeriesConvention
+
+    # A year of SPY dividends is 1.1%, which once passed a cross-source check by
+    # widening its own tolerance to absorb the drift.
+    assert not SeriesConvention(price=RAW).comparable_with(SeriesConvention(price=TOTAL_RETURN))
+    # Volume units may differ between vendors without making prices incomparable.
+    assert SeriesConvention(price=RAW, volume_unit="shares").comparable_with(
+        SeriesConvention(price=RAW, volume_unit="unknown")
+    )

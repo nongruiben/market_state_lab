@@ -18,13 +18,13 @@ def test_ibkr_configuration_is_opt_in_and_read_only() -> None:
 
 def test_pipeline_never_connects_to_ibkr_without_the_flag() -> None:
     """The only path to a connection is the --with-ibkr flag, and the snapshot it
-    fetches lands after the model has already run, so it cannot reach an output."""
+    fetches lands after the report is already built, so it cannot reach an output."""
     source = (Path(PROJECT_ROOT) / "src" / "market_state_lab" / "pipeline.py").read_text(
         encoding="utf-8"
     )
     assert source.count("ReadOnlyIBKRClient(") == 1
     assert "if with_ibkr:" in source
-    assert source.index("state = fit_market_state") < source.index("if with_ibkr:")
+    assert source.index("report = build_report(") < source.index("if with_ibkr:")
 
 
 def test_disabling_ibkr_actually_refuses_to_connect() -> None:

@@ -37,6 +37,7 @@ from typing import Any
 import pandas as pd
 
 from market_state_lab.config import project_path
+from market_state_lab.data.contracts import contract_identity as _contract_identity
 from market_state_lab.data.snapshots import RawArchive, RequestRecord
 
 try:
@@ -136,24 +137,6 @@ def _now_iso() -> str:
 
 def _replace(record: RequestRecord, **changes: Any) -> RequestRecord:
     return RequestRecord(**{**asdict(record), **changes})
-
-
-def _contract_identity(contract: Any) -> dict[str, Any]:
-    """The identity fields of a qualified contract, in a JSON-able form."""
-    return {
-        "con_id": getattr(contract, "conId", None),
-        "symbol": getattr(contract, "symbol", None),
-        "sec_type": getattr(contract, "secType", None),
-        "currency": getattr(contract, "currency", None),
-        "exchange": getattr(contract, "exchange", None),
-        "primary_exchange": getattr(contract, "primaryExchange", None),
-        "expiry": getattr(contract, "lastTradeDateOrContractMonth", None),
-        "strike": getattr(contract, "strike", None),
-        "right": getattr(contract, "right", None),
-        "multiplier": getattr(contract, "multiplier", None),
-        "trading_class": getattr(contract, "tradingClass", None),
-        "local_symbol": getattr(contract, "localSymbol", None),
-    }
 
 
 MARKET_DATA_TYPE_NAMES = {1: "live", 2: "frozen", 3: "delayed", 4: "delayed_frozen"}

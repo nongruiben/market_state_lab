@@ -1,0 +1,15 @@
+{
+  "events": [
+    {
+      "event_id": "trend_damaged:2026-08-27",
+      "label": "trend_damaged",
+      "first_seen": "2026-08-27",
+      "last_seen": "2026-08-27",
+      "confirmed_on": null,
+      "released_on": null,
+      "absent_sessions": 0,
+      "seen_sessions": 1,
+      "notified_on": []
+    }
+  ]
+}

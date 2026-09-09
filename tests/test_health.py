@@ -5,7 +5,7 @@ import pytest
 
 from market_state_lab.config import load_config
 from market_state_lab.data.health import evaluate_manifest, required_health_failures
-from market_state_lab.pipeline import _feature_coverage
+from market_state_lab.pipeline import require_dimensions
 
 
 def test_required_source_accepts_healthy_fallback_provider() -> None:
@@ -77,21 +77,23 @@ def test_offline_fixture_is_exempt_from_history_depth() -> None:
     assert evaluated.loc[0, "model_eligible"]
     assert required_health_failures(evaluated).empty
 
+def test_a_required_dimension_that_is_absent_fails_loudly() -> None:
+    """The guarantee the feature-coverage gate protected, on what now consumes it.
 
-def test_feature_coverage_flags_a_required_gap() -> None:
-    index = pd.date_range("2020-01-01", periods=200, freq="B")
-    features = pd.DataFrame(
-        {
-            "market_return": 0.001,
-            "vix_close": 15.0,
-            "macro_hy_oas": [float("nan")] * 180 + [3.0] * 20,
-        },
+    Its predecessor failed open: a rule evaluated as passing while the feature it
+    read was entirely absent, and the report said nothing.
+    """
+    import numpy as np
+    import pandas as pd
+
+    from market_state_lab.market_evidence import build_evidence
+
+    index = pd.bdate_range("2023-01-02", periods=600)
+    prices = pd.DataFrame(
+        {"spy": 100.0 * np.exp(np.cumsum(np.random.default_rng(2).normal(0, 0.008, 600)))},
         index=index,
     )
-    config = load_config()
-    coverage = _feature_coverage(features, config).set_index("feature")
-    assert coverage.loc["macro_hy_oas", "status"] == "below_threshold"
-    assert coverage.loc["macro_hy_oas", "coverage"] == pytest.approx(0.10)
-    assert not coverage.loc["macro_hy_oas", "required"]
-    assert coverage.loc["market_return", "status"] == "ok"
-    assert coverage.loc["vix_close", "status"] == "ok"
+    require_dimensions(build_evidence(prices))  # trend and volatility are present
+
+    with pytest.raises(RuntimeError, match="absent, not calm"):
+        require_dimensions(build_evidence(pd.DataFrame(index=index)))

@@ -1,7 +1,23 @@
+"""One run: load, gate, describe, compare, and write the artefact set.
+
+This is the single entry point. `cli run` and `scripts/daily_report.py` both
+call it, because section 18 defines one run as producing one set of artefacts
+and two paths would eventually produce two answers.
+
+The forecasting layer that used to sit in the middle of this function is gone.
+It lost to a two-line persistence rule, its drawdown edge disappeared under an
+exposure-matched control, and its conclusions now live in `research.py` as
+registered findings rather than as code nobody should run. What replaced it
+describes rather than predicts, and the benchmark ledger it used to be scored
+against survives in `evaluation.py` - that machinery is the reason the failure
+was findable, so it outlived the thing it measured.
+"""
+
 from __future__ import annotations
 
 import json
 from copy import deepcopy
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -9,107 +25,122 @@ import pandas as pd
 
 from market_state_lab.config import ensure_runtime_directories, project_path
 from market_state_lab.data.fixtures import load_offline_fixture
-from market_state_lab.data.health import (
-    eligible_datasets,
-    evaluate_manifest,
-    required_health_failures,
-)
-from market_state_lab.data.ibkr import ReadOnlyIBKRClient
+from market_state_lab.data.health import evaluate_manifest, required_health_failures
 from market_state_lab.data.public import PublicDataBundle, PublicDataLoader
-from market_state_lab.features import build_features
-from market_state_lab.models import fit_market_state, fit_style
-from market_state_lab.reporting import write_dashboard
+from market_state_lab.data.reconciliation import SourceSeries, reconcile_closes
+from market_state_lab.data.reconciliation import summarise as reconciliation_summary
+from market_state_lab.data.snapshots import latest_sessions, read_snapshot
+from market_state_lab.data.validation import issues_frame, validate_daily_bars
+from market_state_lab.data.validation import summarise as quality_summary
+from market_state_lab.evaluation import compare_against_benchmarks
+from market_state_lab.events import EventLog, EventRules
+from market_state_lab.main_report import ReportInputs, build_report, render_html, render_markdown
+from market_state_lab.market_assessment import assess, state_labels
+from market_state_lab.market_evidence import build_evidence
+from market_state_lab.research import open_registry
 from market_state_lab.timeutils import completed_market_clock
 
 
 def _write_frame(frame: pd.DataFrame, path: Path) -> None:
-    if not frame.empty:
-        path.parent.mkdir(parents=True, exist_ok=True)
+    if frame is not None and not frame.empty:
         frame.to_parquet(path)
 
 
-def _feature_coverage(features: pd.DataFrame, config: dict[str, Any]) -> pd.DataFrame:
-    """Per-feature non-NaN coverage over the modelled panel.
-
-    The manifest checks whether a *source* arrived; nothing checked whether the
-    *feature* built from it actually exists. That gap is how hy_oas sat at 11%
-    coverage and downside_volatility_60 at 19% while every health row said ok.
-    """
-    settings = config["features"].get("coverage", {}) or {}
-    default_minimum = float(settings.get("default_min_coverage", 0.0))
-    rules = settings.get("rules", {}) or {}
-    total = len(features)
-    rows: list[dict[str, Any]] = []
-    # Iterating the surviving columns made this fail open in exactly the case
-    # it exists for: a source that fails health is dropped upstream, so the
-    # feature is never built and produced no row at all. Rules are included
-    # whether or not their column survived.
-    for column in dict.fromkeys([*features.columns, *rules]):
-        rule = rules.get(str(column), {}) or {}
-        present = int(features[column].count()) if column in features else 0
-        coverage = present / total if total else float("nan")
-        minimum = float(rule.get("min_coverage", default_minimum))
-        first_valid = features[column].first_valid_index() if column in features else None
-        rows.append(
-            {
-                "feature": str(column),
-                "rows": total,
-                "observations": present,
-                "coverage": coverage,
-                "min_coverage": minimum,
-                "required": bool(rule.get("required", False)),
-                "first_valid_date": "" if first_valid is None else str(first_valid.date()),
-                "status": "ok" if coverage >= minimum else "below_threshold",
-            }
-        )
-    return pd.DataFrame(rows).sort_values("coverage").reset_index(drop=True)
-
-
 def _eligible_bundle(bundle: PublicDataBundle, manifest: pd.DataFrame) -> PublicDataBundle:
-    eligible = eligible_datasets(manifest)
-    macro = bundle.macro[[column for column in bundle.macro if column in eligible]]
-    # The extra CBOE indices ride inside bundle.vix but are separate manifest
-    # datasets, so gating the whole frame on the "vix" row alone would let a
-    # source that failed its own health check in through the side door.
-    if "vix" in eligible:
-        vix_columns = [column for column in bundle.vix if str(column).startswith("vix_")]
-        vix_columns.extend(column for column in bundle.vix if str(column) in eligible)
-        vix = bundle.vix[list(dict.fromkeys(vix_columns))]
-    else:
-        vix = pd.DataFrame()
-    ofr = bundle.ofr if "financial_stress_index" in eligible else pd.DataFrame()
-    french_columns: list[str] = []
-    if "ff5" in eligible:
-        french_columns.extend(column for column in ("mkt_rf", "smb", "hml", "rmw", "cma", "rf") if column in bundle.french)
-    for dataset in ("momentum", "short_reversal", "long_reversal"):
-        if dataset in eligible and dataset in bundle.french:
-            french_columns.append(dataset)
-    french = bundle.french[french_columns] if french_columns else pd.DataFrame()
-    etf = bundle.etf_close[[column for column in bundle.etf_close if column in eligible]]
-    return PublicDataBundle(
-        macro=macro,
-        vix=vix,
-        ofr=ofr,
-        french=french,
-        etf_close=etf,
-        manifest=manifest,
-        point_in_time_status=bundle.point_in_time_status,
+    """Drop the sources health rejected, rather than letting them through quietly."""
+    rejected = set(
+        manifest.loc[manifest["health_status"].ne("ok"), "dataset"].astype(str)
     )
+    if not rejected:
+        return bundle
+    trimmed = {}
+    for name in ("macro", "vix", "ofr", "french", "etf_close", "etf_close_unadjusted"):
+        frame = getattr(bundle, name, pd.DataFrame())
+        if frame is None or frame.empty:
+            trimmed[name] = frame
+            continue
+        keep = [c for c in frame.columns if c not in rejected]
+        trimmed[name] = frame[keep]
+    return PublicDataBundle(
+        trimmed["macro"], trimmed["vix"], trimmed["ofr"], trimmed["french"],
+        trimmed["etf_close"], bundle.manifest, bundle.point_in_time_status,
+        etf_close_unadjusted=trimmed["etf_close_unadjusted"],
+    )
+
+
+def _as_of(bundle: PublicDataBundle, session: Any) -> PublicDataBundle:
+    """Trim every frame to the settled session.
+
+    A frame carrying a row after the session being described would let the
+    description use a day that had not finished, which is the same lookahead as
+    a forward-looking label and just as invisible in the output.
+    """
+    cutoff = pd.Timestamp(session)
+    trimmed = {}
+    for name in ("macro", "vix", "ofr", "french", "etf_close", "etf_close_unadjusted"):
+        frame = getattr(bundle, name, pd.DataFrame())
+        trimmed[name] = frame.loc[frame.index <= cutoff] if frame is not None and not frame.empty else frame
+    return PublicDataBundle(
+        trimmed["macro"], trimmed["vix"], trimmed["ofr"], trimmed["french"],
+        trimmed["etf_close"], bundle.manifest, bundle.point_in_time_status,
+        etf_close_unadjusted=trimmed["etf_close_unadjusted"],
+    )
+
+
+# The dimensions a description cannot be made without. SPY drives both, so an
+# absence here means the core input failed rather than that a corner of the
+# market is quiet.
+REQUIRED_DIMENSIONS = ("trend", "volatility")
+
+
+def require_dimensions(evidence, required: tuple[str, ...] = REQUIRED_DIMENSIONS) -> None:
+    """Fail loudly when a required dimension has no value at all.
+
+    The guarantee the old feature-coverage gate protected, moved to what the
+    description actually consumes. Its predecessor failed open: a rule was
+    evaluated as passing while the feature it read was entirely absent, and the
+    report said nothing. "Unknown" and "calm" are different statements, and only
+    one of them may be produced silently.
+    """
+    missing = [d for d in required if d in evidence.missing_dimensions]
+    if missing:
+        raise RuntimeError(
+            f"required evidence dimensions are absent, not calm: {', '.join(missing)}"
+        )
+
+
+def _protection(root: Path) -> dict[str, Any]:
+    """The newest protection snapshot, if this machine has recorded one."""
+    history = latest_sessions(root / "data")
+    if history.empty:
+        return {"candidates": None, "controls": [], "snapshot_id": None, "eligible": ()}
+    snapshot = read_snapshot(root / "data", history.iloc[0]["snapshot_id"])
+    return {
+        "candidates": snapshot.tables.get("comparison"),
+        "controls": (
+            snapshot.tables["controls"].to_dict("records")
+            if "controls" in snapshot.tables else []
+        ),
+        "snapshot_id": snapshot.snapshot_id,
+        "eligible": snapshot.eligible_for,
+    }
 
 
 def run_pipeline(
     config: dict[str, Any],
     with_ibkr: bool = False,
     offline: bool = False,
+    notional: float = 100_000.0,
 ) -> dict[str, Path]:
     config = deepcopy(config)
     ensure_runtime_directories(config)
+    root = Path(project_path(config, "."))
     processed = project_path(config, "data", "processed")
     reports = project_path(config, "reports")
+
     if offline:
-        # A fixture run used to write over the live dashboard, so reports/ could
-        # be holding synthetic numbers with nothing in the filename to say so.
-        # Keep the two worlds in separate directories.
+        # A fixture run used to write over the live report, so reports/ could be
+        # holding synthetic numbers with nothing in the filename to say so.
         reports = reports / "offline"
         processed = processed / "offline"
         reports.mkdir(parents=True, exist_ok=True)
@@ -125,9 +156,9 @@ def run_pipeline(
         )
     else:
         clock = completed_market_clock(config)
-    config["_runtime"] = clock.as_dict()
-    if not offline:
         bundle = PublicDataLoader(config).load()
+    config["_runtime"] = clock.as_dict()
+
     manifest = evaluate_manifest(bundle.manifest, config, clock.market_session)
     failures = required_health_failures(manifest)
     if not failures.empty:
@@ -135,101 +166,124 @@ def run_pipeline(
             f"{row.dataset}:{row.health_status}" for row in failures.itertuples(index=False)
         )
         raise RuntimeError(f"Required data health checks failed: {details}")
-    bundle = _eligible_bundle(bundle, manifest)
-    features = build_features(bundle, config, as_of=clock.market_session)
-    coverage = _feature_coverage(features.market, config)
-    coverage.to_csv(reports / "feature_coverage.csv", index=False)
-    short = coverage.loc[coverage["required"] & coverage["status"].eq("below_threshold")]
-    if not short.empty:
-        details = ", ".join(
-            f"{row.feature}:{row.coverage:.1%}<{row.min_coverage:.0%}"
-            for row in short.itertuples(index=False)
-        )
-        raise RuntimeError(f"Required feature coverage below threshold: {details}")
-    state = fit_market_state(features.market, config)
-    style = fit_style(features.style_returns, config)
+    bundle = _as_of(_eligible_bundle(bundle, manifest), clock.market_session)
 
-    uses_latest_macro = not offline and str(config["data"]["fred"].get("vintage_mode", "latest")) != "point_in_time"
-    uses_latest_french = not offline and not bundle.french.empty
-    history_is_latest_vintage = uses_latest_macro or uses_latest_french
-    if bool(config["data"].get("strict_history", False)) and history_is_latest_vintage:
-        raise RuntimeError(
-            "Strict historical mode rejected latest-vintage FRED/French data. "
-            "Enable ALFRED and disable revision-prone French history."
+    evidence = build_evidence(bundle.etf_close, bundle.vix, bundle.macro)
+    require_dimensions(evidence)
+    assessment = assess(evidence)
+    session = str(evidence.as_of.date()) if evidence.as_of is not None else clock.market_session
+
+    spy = bundle.etf_close["spy"].dropna() if "spy" in bundle.etf_close else pd.Series(dtype=float)
+    issues = validate_daily_bars(pd.DataFrame({"close": spy}), "SPY") if not spy.empty else []
+    reconciliation = None
+    raw = getattr(bundle, "etf_close_unadjusted", pd.DataFrame())
+    if not spy.empty and "spy" in getattr(raw, "columns", []):
+        reconciliation = reconciliation_summary(
+            reconcile_closes(
+                "SPY",
+                SourceSeries("adjusted", spy, adjusted=True),
+                SourceSeries("raw", raw["spy"].dropna(), adjusted=True),
+            )
         )
-    state.latest.update(
-        {
-            "run_clock": clock.as_dict(),
-            "information_date": clock.market_session,
-            "run_date": clock.run_date_local,
-            "history_is_latest_vintage": history_is_latest_vintage,
-            "historical_backtest_eligible": not history_is_latest_vintage,
-            "point_in_time_status": bundle.point_in_time_status,
-        }
+    benchmarks = compare_against_benchmarks(spy) if len(spy) > 300 else pd.DataFrame()
+
+    events_path = root / "data" / ("events_offline.json" if offline else "events.json")
+    log = EventLog.load(events_path, EventRules())
+    previous = [e.label for e in log.open_events()]
+    news = log.observe(state_labels(evidence), session)
+    log.save(events_path)
+
+    protection = _protection(root)
+    report = build_report(
+        ReportInputs(
+            evidence=evidence,
+            assessment=assessment,
+            snapshot_id=protection["snapshot_id"],
+            session_date=session,
+            data_quality=quality_summary(issues),
+            eligible_for=protection["eligible"],
+            new_events=news,
+            open_events=log.open_events(),
+            previous_labels=previous,
+            candidates=protection["candidates"],
+            controls=protection["controls"],
+            reference_notional=notional,
+            reconciliation=reconciliation,
+        )
     )
-    _write_frame(bundle.macro, processed / "macro.parquet")
-    _write_frame(bundle.vix, processed / "vix.parquet")
-    _write_frame(bundle.ofr, processed / "ofr_fsi.parquet")
-    _write_frame(bundle.french, processed / "french_factors.parquet")
-    _write_frame(bundle.etf_close, processed / "etf_close.parquet")
-    _write_frame(features.market, processed / "market_features.parquet")
-    _write_frame(features.style_returns, processed / "style_returns.parquet")
-    _write_frame(state.history, reports / "market_state_history.parquet")
-    _write_frame(style.history, reports / "style_history.parquet")
-    state.diagnostics.to_csv(reports / "model_refit_diagnostics.csv", index=False)
-    state.comparison.to_csv(reports / "model_comparison.csv", index=False)
-    state.decision_value.to_csv(reports / "decision_value_comparison.csv", index=False)
-    state.exposure_tradeoff.to_csv(reports / "exposure_tradeoff.csv", index=False)
 
     if with_ibkr:
-        symbols = [str(symbol) for symbol in config["ibkr"]["snapshot_symbols"]]
-        try:
-            with ReadOnlyIBKRClient(config) as client:
-                snapshot = client.delayed_snapshots(symbols)
-                snapshot.to_csv(reports / "ibkr_snapshot.csv")
-                ibkr_status = pd.DataFrame(
-                    [{
-                        "dataset": "delayed_snapshots",
-                        "provider": "IBKR TWS read-only",
-                        "status": "success",
-                        "rows": len(snapshot),
-                        "earliest_date": "",
-                        "latest_date": pd.Timestamp.utcnow().date().isoformat(),
-                        "vintage_mode": "snapshot",
-                        "error": "",
-                    }]
-                )
-        except Exception as exc:
-            ibkr_status = pd.DataFrame(
-                [{
-                    "dataset": "delayed_snapshots",
-                    "provider": "IBKR TWS read-only",
-                    "status": "failed",
-                    "rows": 0,
-                    "earliest_date": "",
-                    "latest_date": "",
-                    "vintage_mode": "snapshot",
-                    "error": str(exc),
-                }]
-            )
-        manifest = evaluate_manifest(
-            pd.concat([manifest, ibkr_status], ignore_index=True), config, clock.market_session
-        )
+        manifest = _append_ibkr_status(config, manifest, clock, reports)
 
-    manifest.to_csv(reports / "data_manifest.csv", index=False)
-    (reports / "latest_market_state.json").write_text(
-        json.dumps(state.latest, indent=2, ensure_ascii=False, allow_nan=False), encoding="utf-8"
+    _write_frame(bundle.macro, processed / "macro.parquet")
+    _write_frame(bundle.vix, processed / "vix.parquet")
+    _write_frame(bundle.etf_close, processed / "etf_close.parquet")
+
+    run_id = f"{session}-{datetime.now(timezone.utc).strftime('%H%M%SZ')}"
+    out = reports / run_id
+    out.mkdir(parents=True, exist_ok=True)
+    registry = open_registry().summary()
+
+    (out / "run_manifest.json").write_text(json.dumps({
+        "run_id": run_id,
+        "session_date": session,
+        "offline": offline,
+        "built_at_utc": datetime.now(timezone.utc).isoformat(),
+        "reference_notional_usd": notional,
+        "protection_snapshot": protection["snapshot_id"],
+        "approved_uses": list(protection["eligible"]),
+        "research_registry": registry,
+        "runtime": clock.as_dict(),
+    }, indent=2, default=str), encoding="utf-8")
+    (out / "data_quality_summary.json").write_text(
+        json.dumps(quality_summary(issues), indent=2, default=str), encoding="utf-8"
     )
-    style.latest.to_csv(reports / "latest_style_state.csv", index=False)
-    write_dashboard(reports / "market_state_dashboard.html", state, style, manifest, config)
-    return {
-        "dashboard": reports / "market_state_dashboard.html",
-        "market_state": reports / "latest_market_state.json",
-        "style_state": reports / "latest_style_state.csv",
-        "manifest": reports / "data_manifest.csv",
-        "model_comparison": reports / "model_comparison.csv",
-        "model_diagnostics": reports / "model_refit_diagnostics.csv",
-        "decision_value": reports / "decision_value_comparison.csv",
-        "exposure_tradeoff": reports / "exposure_tradeoff.csv",
-        "feature_coverage": reports / "feature_coverage.csv",
-    }
+    issues_frame(issues).to_csv(out / "data_quality_issues.csv", index=False)
+    pd.DataFrame([reconciliation] if reconciliation else []).to_csv(
+        out / "source_reconciliation.csv", index=False
+    )
+    benchmarks.to_csv(out / "benchmark_ledger.csv", index=False)
+    evidence.frame().to_parquet(out / "market_evidence.parquet")
+    (out / "market_assessment.json").write_text(
+        json.dumps(assessment.as_dict(), indent=2, default=str), encoding="utf-8"
+    )
+    candidates = protection["candidates"]
+    (candidates if candidates is not None else pd.DataFrame()).to_csv(
+        out / "instrument_candidates.csv", index=False
+    )
+    pd.DataFrame(report["6_scenarios"]["rows"]).to_csv(
+        out / "scenario_comparison.csv", index=False
+    )
+    (out / "report.md").write_text(render_markdown(report), encoding="utf-8")
+    (out / "report.html").write_text(
+        render_html(report, f"Market state {session}"), encoding="utf-8"
+    )
+    manifest.to_csv(out / "data_manifest.csv", index=False)
+
+    return {name: out / name for name in sorted(p.name for p in out.iterdir())}
+
+
+def _append_ibkr_status(config, manifest, clock, reports) -> pd.DataFrame:
+    """A snapshot fetched after everything above, so it cannot reach an output."""
+    from market_state_lab.data.ibkr import ReadOnlyIBKRClient
+
+    symbols = [str(symbol) for symbol in config["ibkr"]["snapshot_symbols"]]
+    try:
+        with ReadOnlyIBKRClient(config) as client:
+            contracts = [client.qualify_stock(symbol) for symbol in symbols]
+            snapshot = client.quotes(contracts)
+            snapshot.to_csv(reports / "ibkr_snapshot.csv", index=False)
+            status = {"status": "success", "rows": len(snapshot), "error": ""}
+    except Exception as exc:
+        status = {"status": "failed", "rows": 0, "error": f"{type(exc).__name__}: {exc}"}
+    row = pd.DataFrame([{
+        "dataset": "ibkr_quotes",
+        "provider": "IBKR TWS read-only",
+        "earliest_date": "",
+        "latest_date": pd.Timestamp.utcnow().date().isoformat(),
+        "vintage_mode": "snapshot",
+        **status,
+    }])
+    return evaluate_manifest(
+        pd.concat([manifest, row], ignore_index=True), config, clock.market_session
+    )
