@@ -295,7 +295,7 @@ def write_snapshot(
     # separate session. The plan keeps revision_id in the lineage for exactly
     # this: a corrected or fuller observation supersedes, it does not replace,
     # and it must never silently rewrite the earlier conclusion.
-    prior = _session_revisions(root, session_date)
+    prior = _session_revisions(root, session_date, run_parameters or {})
     if any(p["snapshot_id"] == snapshot_id for p in prior):
         existing = next(p for p in prior if p["snapshot_id"] == snapshot_id)
         # The data is unchanged, so nothing is rewritten - but the verdict about
@@ -455,13 +455,27 @@ def list_snapshots(root: Path) -> pd.DataFrame:
     )
 
 
-def _session_revisions(root: Path, session_date: str) -> list[dict[str, Any]]:
-    """Every manifest already written for this session, oldest revision first."""
+def _session_revisions(
+    root: Path,
+    session_date: str,
+    run_parameters: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Prior manifests for this session *under the same run parameters*.
+
+    Revisions are scoped to the parameters as well as the day, because a
+    30-60d view and a 60-90d view of one close are not corrections of each
+    other - they are two questions. Chaining them would have the second
+    "supersede" the first, which reads as the earlier answer having been wrong.
+    """
+    wanted = run_parameters or {}
     found = []
     for path in sorted((Path(root) / "manifests").glob("*.json")):
         manifest = json.loads(path.read_text(encoding="utf-8"))
-        if manifest.get("session_date") == session_date:
-            found.append(manifest)
+        if manifest.get("session_date") != session_date:
+            continue
+        if manifest.get("run_parameters", {}) != wanted:
+            continue
+        found.append(manifest)
     return sorted(found, key=lambda m: m.get("revision", 1))
 
 

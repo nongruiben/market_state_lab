@@ -317,3 +317,28 @@ def test_the_same_parameters_still_resolve_to_one_snapshot(tmp_path) -> None:
     )
     assert again.snapshot_id == first.snapshot_id
     assert len(list_snapshots(tmp_path)) == 1
+
+
+def test_two_views_of_one_session_do_not_supersede_each_other(tmp_path) -> None:
+    # A 30-60d view and a 60-90d view are two questions about one close, not a
+    # correction of one another. Chaining them would read as the earlier answer
+    # having been wrong.
+    near = write_snapshot(
+        tmp_path, "2026-09-08", {"q": _quotes()}, CONFIG, run_parameters={"horizon": "30-60d"}
+    )
+    far = write_snapshot(
+        tmp_path, "2026-09-08", {"q": _quotes()}, CONFIG, run_parameters={"horizon": "60-90d"}
+    )
+    assert near.manifest["revision"] == 1 and far.manifest["revision"] == 1
+    assert near.manifest["supersedes"] is None and far.manifest["supersedes"] is None
+
+
+def test_a_correction_within_one_view_still_supersedes(tmp_path) -> None:
+    first = write_snapshot(
+        tmp_path, "2026-09-08", {"q": _quotes()}, CONFIG, run_parameters={"horizon": "30-60d"}
+    )
+    second = write_snapshot(
+        tmp_path, "2026-09-08", {"q": _quotes(7.99)}, CONFIG, run_parameters={"horizon": "30-60d"}
+    )
+    assert second.manifest["revision"] == 2
+    assert second.manifest["supersedes"] == first.snapshot_id
