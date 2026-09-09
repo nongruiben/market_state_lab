@@ -366,5 +366,68 @@ __all__ = [
     "ReportInputs",
     "account_fields_present",
     "build_report",
+    "render_html",
     "render_markdown",
 ]
+
+
+def render_html(report: dict[str, Any], title: str = "Market state") -> str:
+    """The same seven sections as a page. Rendered from the report, not the Markdown.
+
+    A small hand-written renderer rather than a Markdown dependency: the subset
+    emitted here is headings, lists and two tables, and converting the prose a
+    second time would give two documents that could drift apart.
+    """
+    markdown = render_markdown(report)
+    body: list[str] = []
+    rows: list[str] = []
+
+    def flush_table() -> None:
+        if not rows:
+            return
+        head, *rest = [r for r in rows if not set(r.replace("|", "").strip()) <= {"-", " "}]
+        cells = [c.strip() for c in head.strip("|").split("|")]
+        body.append("<table><thead><tr>" + "".join(f"<th>{_esc(c)}</th>" for c in cells))
+        body.append("</tr></thead><tbody>")
+        for line in rest:
+            values = [c.strip() for c in line.strip("|").split("|")]
+            body.append("<tr>" + "".join(f"<td>{_esc(v)}</td>" for v in values) + "</tr>")
+        body.append("</tbody></table>")
+        rows.clear()
+
+    for line in markdown.splitlines():
+        if line.startswith("|"):
+            rows.append(line)
+            continue
+        flush_table()
+        if line.startswith("# "):
+            body.append(f"<h1>{_esc(line[2:])}</h1>")
+        elif line.startswith("## "):
+            body.append(f"<h2>{_esc(line[3:])}</h2>")
+        elif line.startswith("- "):
+            body.append(f"<li>{_esc(line[2:])}</li>")
+        elif line.strip():
+            body.append(f"<p>{_esc(line)}</p>")
+    flush_table()
+
+    return (
+        "<!doctype html><meta charset='utf-8'>"
+        f"<title>{_esc(title)}</title>"
+        "<style>body{font:14px/1.5 system-ui,sans-serif;max-width:60rem;margin:2rem auto;"
+        "padding:0 1rem}table{border-collapse:collapse;width:100%;margin:1rem 0}"
+        "th,td{border:1px solid #ddd;padding:.35rem .5rem;text-align:left}"
+        "th{background:#f6f6f6}h2{margin-top:2rem;border-bottom:1px solid #eee}"
+        "li{margin:.2rem 0}</style>"
+        + "".join(body)
+    )
+
+
+def _esc(text: str) -> str:
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("**", "")
+        .replace("`", "")
+    )
