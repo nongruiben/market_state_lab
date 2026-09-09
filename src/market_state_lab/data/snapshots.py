@@ -79,6 +79,16 @@ VOLATILE_COLUMNS = frozenset(
         "logged_at_utc",
         "retrieved_at_utc",
         "exchange_time_utc",
+        # Greeks are best-effort and load-bearing for nothing: TWS computes and
+        # sends them for some legs and not others, and on a frozen book what
+        # varies between two fetches is whether they arrived, not what they are.
+        # Open interest deliberately stays out of this set - it is a real
+        # quantity, the screen turns on it, and a genuine change in it is a
+        # revision worth having.
+        "implied_volatility",
+        "delta",
+        "underlying_price",
+        "open_interest_attempt",
     }
 )
 
@@ -226,7 +236,10 @@ def build_snapshot_id(
     return f"{session_date}-{digest.hexdigest()[:12]}"
 
 
-def default_eligibility(qualifications: set[str] | None) -> tuple[tuple[str, ...], dict[str, str]]:
+def default_eligibility(
+    qualifications: set[str] | None,
+    blocked: set[str] | frozenset[str] = frozenset(),
+) -> tuple[tuple[str, ...], dict[str, str]]:
     """What a post-close run may grant its snapshot, from the rows' qualifications.
 
     The question is whether the data could be judged, not whether the
@@ -251,8 +264,18 @@ def default_eligibility(qualifications: set[str] | None) -> tuple[tuple[str, ...
         "training": "one session; a training set is granted over a series, not a run",
     }
     unjudged = (qualifications or set()) & {"DEGRADED", "UNAVAILABLE"}
-    eligible: list[str] = ["day_end_analysis"]
-    if qualifications and not unjudged:
+    eligible: list[str] = []
+    # A field-level quarantine takes a purpose away outright: the validation
+    # layer already decided that data cannot support it, and a grant here would
+    # override a verdict made closer to the evidence.
+    if "day_end_analysis" in blocked:
+        ineligible["day_end_analysis"] = "quarantined by a field-level check"
+    else:
+        eligible.append("day_end_analysis")
+
+    if "instrument_quotes" in blocked:
+        ineligible["instrument_quotes"] = "quarantined by a field-level check"
+    elif qualifications and not unjudged:
         eligible.append("instrument_quotes")
     else:
         ineligible["instrument_quotes"] = (
@@ -432,6 +455,9 @@ def list_snapshots(root: Path) -> pd.DataFrame:
                 "snapshot_id": manifest["snapshot_id"],
                 "session_date": manifest["session_date"],
                 "revision": manifest.get("revision", 1),
+                # The question this snapshot answers, so two views of one close
+                # are never mistaken for two revisions of one answer.
+                "view": _canonical_json(manifest.get("run_parameters", {})).decode("utf-8"),
                 "supersedes": manifest.get("supersedes"),
                 "changed_tables": ",".join(manifest.get("changed_tables") or []) or None,
                 "written_at_utc": manifest.get("written_at_utc"),
@@ -444,7 +470,7 @@ def list_snapshots(root: Path) -> pd.DataFrame:
         )
     if not rows:
         return pd.DataFrame(
-            columns=["snapshot_id", "session_date", "revision", "supersedes",
+            columns=["snapshot_id", "session_date", "revision", "view", "supersedes",
                      "changed_tables", "written_at_utc", "tables", "rows",
                      "requests", "quality_issues", "eligible_for"]
         )
@@ -489,22 +515,31 @@ def _changed_tables(previous: dict[str, Any], tables: dict[str, pd.DataFrame]) -
 
 
 def latest_sessions(root: Path) -> pd.DataFrame:
-    """One row per session - the newest revision of each.
+    """One row per session *and view* - the newest revision of each.
 
-    `list_snapshots` shows every revision; this is the history, and a session
-    looked at twice is still one session.
+    A view is a session under one set of run parameters. Grouping by date alone
+    would put a 30-60d and a 60-90d reading of the same close in one bucket and
+    call one of them "the latest", which is not a thing either of them is.
+    `list_snapshots` still shows every revision; `session_count` below is the
+    answer to "how many days have I recorded".
     """
     every = list_snapshots(root)
     if every.empty:
         return every
     newest = (
-        every.sort_values(["session_date", "revision"])
-        .groupby("session_date", as_index=False)
+        every.sort_values(["session_date", "view", "revision"])
+        .groupby(["session_date", "view"], as_index=False)
         .last()
     )
-    counts = every.groupby("session_date").size().rename("revisions")
+    counts = every.groupby(["session_date", "view"]).size().rename("revisions")
     return (
-        newest.merge(counts, on="session_date")
-        .sort_values("session_date", ascending=False)
+        newest.merge(counts, on=["session_date", "view"])
+        .sort_values(["session_date", "view"], ascending=[False, True])
         .reset_index(drop=True)
     )
+
+
+def session_count(root: Path) -> int:
+    """How many distinct sessions are on disk, whatever they were asked about."""
+    every = list_snapshots(root)
+    return 0 if every.empty else int(every["session_date"].nunique())

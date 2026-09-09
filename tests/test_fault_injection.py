@@ -18,6 +18,12 @@ import pandas as pd
 import pytest
 
 from market_state_lab.data.snapshots import default_eligibility
+from market_state_lab.data.validation import (
+    DAY_END,
+    blocked_purposes,
+    crisis_reading_is_allowed,
+    validate_daily_bars,
+)
 from market_state_lab.defense_tools import (
     DEGRADED,
     UNAVAILABLE,
@@ -263,15 +269,58 @@ def test_replaying_the_same_recorded_plan_reproduces_the_same_screen(tmp_path) -
 
 
 # ---------------------------------------------------------------------------
+# Row 1: prices x100 and an inverted bar -> the records are quarantined and no
+# market-crisis reading may be formed from them.
+# ---------------------------------------------------------------------------
+
+
+def _bars(closes: list[float]) -> pd.DataFrame:
+    index = pd.date_range("2026-09-01", periods=len(closes), freq="D")
+    return pd.DataFrame(
+        {
+            "open": [c * 0.99 for c in closes],
+            "high": [c * 1.01 for c in closes],
+            "low": [c * 0.98 for c in closes],
+            "close": closes,
+        },
+        index=index,
+    )
+
+
+def test_a_hundredfold_price_is_quarantined_and_reads_as_no_crisis() -> None:
+    issues = validate_daily_bars(_bars([770.0, 77000.0, 771.0]), "SPY")
+    scale = [i for i in issues if i.code == "price_scale_break"]
+    assert scale and all(i.severity == "quarantine" for i in scale)
+    # The injected fault must not become a market signal of any kind.
+    assert not crisis_reading_is_allowed(issues)
+    assert DAY_END in blocked_purposes(issues)
+
+
+def test_an_inverted_bar_is_quarantined_and_reads_as_no_crisis() -> None:
+    frame = _bars([770.0, 771.0])
+    frame.loc[frame.index[1], ["high", "low"]] = [700.0, 800.0]
+    issues = validate_daily_bars(frame, "SPY")
+    assert any(i.code == "ohlc_inverted" and i.severity == "quarantine" for i in issues)
+    assert not crisis_reading_is_allowed(issues)
+
+
+def test_the_filter_that_catches_the_fault_does_not_catch_a_crash() -> None:
+    # Row 2's restraint, and the reason row 1 keys on a decimal factor rather
+    # than on size: 1987 was -34% in a session, and a filter that erased the
+    # injected fault by magnitude would erase that too.
+    issues = validate_daily_bars(_bars([770.0, 508.0, 520.0]), "SPY")
+    assert not any(i.severity == "quarantine" for i in issues)
+    assert crisis_reading_is_allowed(issues)
+
+
+# ---------------------------------------------------------------------------
 # Unbuilt rows. They stay listed until their layer lands:
 #
-# 1  prices x100, inverted OHLC   -> data/validation.py (6.2): finite positive
-#                                   OHLC with high/low bounds; a quote set x100
-#                                   must be quarantined, never a market-crisis
-#                                   signal.
-# 2  real crash confirmed by a    -> data/reconciliation.py (6.4): a crash the
-#    second source                    second source confirms is kept; no outlier
-#                                     filter may delete risk.
+# 2  real crash confirmed by a    -> data/reconciliation.py (6.4): the second
+#    second source                    source is what confirms it. The half that
+#                                     does not need a second source - a crash is
+#                                     reviewed and never deleted - is covered
+#                                     above; confirmation is not.
 # 3  split/dividend口径 mismatch  -> data/validation.py (6.3): corporate actions
 #                                   recorded with effective_at and known_at.
 # 9  multi-source common anomaly -> data/reconciliation.py (6.4): a common

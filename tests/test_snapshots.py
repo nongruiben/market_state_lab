@@ -342,3 +342,33 @@ def test_a_correction_within_one_view_still_supersedes(tmp_path) -> None:
     )
     assert second.manifest["revision"] == 2
     assert second.manifest["supersedes"] == first.snapshot_id
+
+
+def test_two_views_of_one_session_are_one_session_and_two_views(tmp_path) -> None:
+    from market_state_lab.data.snapshots import session_count
+
+    write_snapshot(tmp_path, "2026-09-08", {"q": _quotes()}, CONFIG,
+                   run_parameters={"horizon": "30-60d"})
+    write_snapshot(tmp_path, "2026-09-08", {"q": _quotes()}, CONFIG,
+                   run_parameters={"horizon": "60-90d"})
+    write_snapshot(tmp_path, "2026-09-04", {"q": _quotes(7.4)}, CONFIG,
+                   run_parameters={"horizon": "30-60d"})
+    # Grouping by date alone would call one horizon "the latest" reading of a
+    # close, which is not a thing either of them is.
+    assert session_count(tmp_path) == 2
+    assert len(latest_sessions(tmp_path)) == 3
+
+
+def test_greeks_arriving_or_not_does_not_make_a_revision() -> None:
+    # They are recorded and used for nothing. On a frozen book what differs
+    # between two fetches is whether TWS sent them, not what they are.
+    with_greeks = _quotes().assign(implied_volatility=[0.145, 0.175], delta=[-0.31, -0.15])
+    without = _quotes().assign(implied_volatility=[None, 0.175], delta=[None, -0.15])
+    assert frame_hash(with_greeks) == frame_hash(without)
+
+
+def test_open_interest_deliberately_stays_in_the_identity() -> None:
+    # The screen turns on it, so a genuine change is a revision worth having.
+    thin = _quotes().assign(open_interest=[80.0, 8054.0])
+    thick = _quotes().assign(open_interest=[9695.0, 8054.0])
+    assert frame_hash(thin) != frame_hash(thick)

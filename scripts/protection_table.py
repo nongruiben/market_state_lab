@@ -41,7 +41,13 @@ from market_state_lab.data.ibkr import ReadOnlyIBKRClient  # noqa: E402
 from market_state_lab.data.snapshots import (  # noqa: E402
     default_eligibility,
     latest_sessions,
+    session_count,
     write_snapshot,
+)
+from market_state_lab.data.validation import (  # noqa: E402
+    blocked_purposes,
+    issues_frame,
+    validate_quotes,
 )
 from market_state_lab.defense_tools import (  # noqa: E402
     ScreenLimits,
@@ -152,6 +158,9 @@ def analyse(client: Any, symbol: str, args: argparse.Namespace) -> dict[str, Any
 
     plan = attach_quotes(plan, quotes.loc[quotes["right"].eq("P")] if len(quotes) else quotes)
     plan = screen_candidates(plan, args.limits, stale["basis"], market_is_open())
+    # Field-level checks run beside the screen, not instead of it: the screen
+    # judges the instrument, this judges the numbers describing it.
+    quality = validate_quotes(quotes, frozen_book=frozen) if len(quotes) else []
 
     days = {
         str(r["expiry"]): r["days_to_expiry"]
@@ -195,6 +204,7 @@ def analyse(client: Any, symbol: str, args: argparse.Namespace) -> dict[str, Any
         "trading_class": chain["trading_class"], "staleness": stale,
         "parity_verdict": parity_verdict(parity), "parity": parity,
         "plan": plan, "candidates": ranked, "controls": controls,
+        "quality_issues": quality,
         "horizon_days": horizon_days, "legs_synchronous": frozen,
     }
 
@@ -323,7 +333,10 @@ def store(
     qualifications = set(frames.get("candidates", pd.DataFrame()).get(
         "quote_qualification", pd.Series(dtype=str)
     ))
-    eligible, ineligible = default_eligibility(qualifications)
+    quality = [i for r in usable for i in r.get("quality_issues", [])]
+    eligible, ineligible = default_eligibility(qualifications, blocked_purposes(quality))
+    if quality:
+        frames["quality_issues"] = issues_frame(quality)
 
     snapshot = write_snapshot(
         ROOT / "data",
@@ -362,9 +375,9 @@ def store(
         line += f", superseding {snapshot.manifest['supersedes']} (changed: {changed})"
     print(
         f"{line}  eligible_for={','.join(eligible)}"
-        f"\n  {len(history)} session(s) recorded"
+        f"\n  {session_count(ROOT / 'data')} session(s) recorded"
         f" ({history['session_date'].min()} to {history['session_date'].max()}),"
-        f" {int(history['revisions'].sum())} observation(s)"
+        f" in {len(history)} view(s), {int(history['revisions'].sum())} observation(s)"
         " - the option-price history the feed will not sell is only ever kept forward"
     )
     return snapshot.snapshot_id
