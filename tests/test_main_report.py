@@ -220,3 +220,37 @@ def test_the_scenario_table_shows_the_shortlist_beside_the_controls() -> None:
 def test_an_empty_scenario_table_says_so_rather_than_rendering_blank() -> None:
     markdown = render_markdown(build_report(_inputs(controls=[])))
     assert "_nothing priced_" in markdown
+
+
+def test_rows_for_different_underlyings_are_labelled_and_warned_about() -> None:
+    # Each underlying is priced against its own reference, so rows from two of
+    # them are not alternatives to each other. An undifferentiated table renders
+    # "no new protection" once per symbol with nothing to tell them apart.
+    controls = [
+        {"symbol": s, "label": "no new protection", "structure": "unhedged",
+         "cost_usd": 0.0, "pnl_at_worst_move": -20000.0}
+        for s in ("SPY", "QQQ", "IWM")
+    ]
+    report = build_report(_inputs(controls=controls))
+    scenarios = report["6_scenarios"]
+    assert scenarios["underlyings"] == ["IWM", "QQQ", "SPY"]
+    markdown = render_markdown(report)
+    assert "| underlying |" in markdown
+    assert "not alternatives to each other" in markdown
+
+
+def test_a_repeated_control_for_one_underlying_is_shown_once() -> None:
+    duplicated = [
+        {"symbol": "SPY", "label": "no new protection", "structure": "unhedged",
+         "cost_usd": 0.0}
+    ] * 3
+    rows = build_report(_inputs(controls=duplicated))["6_scenarios"]["rows"]
+    assert len(rows) == 1
+
+
+def test_a_single_underlying_needs_no_cross_symbol_warning() -> None:
+    markdown = render_markdown(build_report(_inputs(controls=[
+        {"symbol": "SPY", "label": "no new protection", "structure": "unhedged",
+         "cost_usd": 0.0}
+    ])))
+    assert "not alternatives to each other" not in markdown

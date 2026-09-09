@@ -154,7 +154,17 @@ def _instruments(inputs: ReportInputs) -> dict[str, Any]:
 
 def _scenarios(inputs: ReportInputs) -> dict[str, Any]:
     """Section 6. Payoff, cost and what is still exposed, on one yardstick."""
-    rows = list(inputs.controls)
+    # One control pair per underlying, not per snapshot row: a controls table
+    # covering three symbols renders "no new protection" three times with
+    # nothing to tell them apart.
+    seen: set[tuple[str, str]] = set()
+    rows: list[dict[str, Any]] = []
+    for row in inputs.controls:
+        key = (str(row.get("symbol", "")), str(row.get("label", "")))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append(row)
     if inputs.candidates is not None and not inputs.candidates.empty:
         picked = inputs.candidates
         if "shortlisted" in picked:
@@ -166,17 +176,24 @@ def _scenarios(inputs: ReportInputs) -> dict[str, Any]:
             {
                 key: row.get(key)
                 for key in (
-                    "label", "structure", "contracts", "cost_usd", "cost_pct_of_notional",
-                    "pnl_at_worst_move", "protection_at_worst_move", "pnl_if_flat",
-                    "pnl_at_best_move", "protected_below", "uncovered_shares",
+                    "symbol", "label", "structure", "contracts", "cost_usd",
+                    "cost_pct_of_notional", "pnl_at_worst_move", "protection_at_worst_move",
+                    "pnl_if_flat", "pnl_at_best_move", "protected_below", "uncovered_shares",
                     "coverage_ratio", "market_data_type",
                 )
             }
             for row in rows
         ],
+        "underlyings": sorted({str(row.get("symbol")) for row in rows if row.get("symbol")}),
         "note": (
             "payoff is at expiry only; the reference exposure is a stated yardstick and "
             "not anyone's position"
+        ),
+        "cross_symbol_warning": (
+            "each underlying is priced against its own reference exposure, so rows for "
+            "different symbols are not alternatives to each other; comparing them as "
+            "hedges for one portfolio would need a fixed common reference and a stated "
+            "mapping, which this does not have"
         ),
     }
 
@@ -258,11 +275,15 @@ def render_markdown(report: dict[str, Any]) -> str:
     ]
     if status.get("cross_source"):
         cross = status["cross_source"]
-        lines.append(
-            f"- cross-source: {cross.get('compared_days')} sessions against "
-            f"{', '.join(cross.get('sources', []))}, "
-            f"{cross.get('days_outside_tolerance')} outside tolerance"
-        )
+        if cross.get("compared_days"):
+            lines.append(
+                f"- cross-source: {cross.get('compared_days')} sessions against "
+                f"{', '.join(cross.get('sources', []))}, "
+                f"{cross.get('days_outside_tolerance')} outside tolerance"
+            )
+        else:
+            # An absent check has to appear, or a reader assumes it passed.
+            lines.append(f"- cross-source: {cross.get('note', 'not run')}")
 
     lines += [
         "",
@@ -306,8 +327,12 @@ def render_markdown(report: dict[str, Any]) -> str:
 
     lines += ["", "## 6. Payoff against the reference exposure", ""]
     lines.append(
-        f"Reference: ${scenarios['reference_notional_usd']:,.0f}. {scenarios['note']}"
+        f"Reference: ${scenarios['reference_notional_usd']:,.0f} per underlying. "
+        f"{scenarios['note']}"
     )
+    if len(scenarios.get("underlyings", [])) > 1:
+        lines.append("")
+        lines.append(scenarios["cross_symbol_warning"])
     lines.append("")
     lines.append(_scenario_table(scenarios["rows"]))
 
@@ -337,12 +362,17 @@ def _indicator_table(indicators: list[dict[str, Any]]) -> str:
 
 
 def _scenario_table(rows: list[dict[str, Any]]) -> str:
-    header = "| candidate | structure | cost | at -20% | vs unhedged | if flat | at +10% |"
-    rule = "|---|---|---|---|---|---|---|"
+    header = (
+        "| underlying | candidate | structure | cost | at -20% | vs unhedged | "
+        "if flat | at +10% |"
+    )
+    rule = "|---|---|---|---|---|---|---|---|"
     out = []
     for row in rows:
         out.append(
-            "| {label} | {structure} | {cost} | {worst} | {protection} | {flat} | {best} |".format(
+            "| {symbol} | {label} | {structure} | {cost} | {worst} | {protection} | "
+            "{flat} | {best} |".format(
+                symbol=row.get("symbol") or "—",
                 label=row.get("label", "—"),
                 structure=row.get("structure", "—"),
                 cost=_money(row.get("cost_usd")),

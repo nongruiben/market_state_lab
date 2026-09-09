@@ -27,8 +27,7 @@ from market_state_lab.config import ensure_runtime_directories, project_path
 from market_state_lab.data.fixtures import load_offline_fixture
 from market_state_lab.data.health import evaluate_manifest, required_health_failures
 from market_state_lab.data.public import PublicDataBundle, PublicDataLoader
-from market_state_lab.data.reconciliation import SourceSeries, reconcile_closes
-from market_state_lab.data.reconciliation import summarise as reconciliation_summary
+from market_state_lab.data.reconciliation import unverifiable
 from market_state_lab.data.snapshots import latest_sessions, read_snapshot
 from market_state_lab.data.validation import issues_frame, validate_daily_bars
 from market_state_lab.data.validation import summarise as quality_summary
@@ -175,16 +174,23 @@ def run_pipeline(
 
     spy = bundle.etf_close["spy"].dropna() if "spy" in bundle.etf_close else pd.Series(dtype=float)
     issues = validate_daily_bars(pd.DataFrame({"close": spy}), "SPY") if not spy.empty else []
-    reconciliation = None
-    raw = getattr(bundle, "etf_close_unadjusted", pd.DataFrame())
-    if not spy.empty and "spy" in getattr(raw, "columns", []):
-        reconciliation = reconciliation_summary(
-            reconcile_closes(
-                "SPY",
-                SourceSeries("adjusted", spy, adjusted=True),
-                SourceSeries("raw", raw["spy"].dropna(), adjusted=True),
-            )
-        )
+    # No second source on this path, and saying so is the only honest option.
+    # One vendor's adjusted series against its own raw series is one source in
+    # two conventions, not corroboration - and making it pass would take
+    # declaring the raw series adjusted, which is the false declaration that
+    # already cost this project a cross-source check once. Real verification
+    # lives in scripts/reconcile_spy.py, where TWS is a genuinely separate feed.
+    reconciliation = {
+        "symbol": "SPY",
+        "sources": ["public data only"],
+        "compared_days": 0,
+        "agreed": None,
+        "note": unverifiable(
+            "SPY daily closes",
+            "this run used one vendor; run scripts/reconcile_spy.py with TWS up for "
+            "an independent second source",
+        ).detail,
+    }
     benchmarks = compare_against_benchmarks(spy) if len(spy) > 300 else pd.DataFrame()
 
     events_path = root / "data" / ("events_offline.json" if offline else "events.json")
