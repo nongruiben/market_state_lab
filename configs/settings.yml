@@ -261,29 +261,6 @@ models:
   style:
     score_temperature: 1.25
 
-news:
-  enabled: false
-  fetch_on_run: true
-  sidecar_script: "../mega/News_analysis/tws_news_fetcher_significant_web_research_v2.py"
-  raw_news_json: "../mega/News_analysis/tws_significant_news_all.json"
-  raw_web_json: "../mega/News_analysis/tws_significant_news_web_research.json"
-  narrative_report: "../mega/News_analysis/tws_significant_news_analysis.md"
-  lookback_hours: 24
-  fallback_max_age_hours: 96
-  llm_enabled: true
-  llm_provider: deepseek
-  llm_model: deepseek-v4-pro
-  llm_base_url: "https://api.deepseek.com"
-  llm_temperature: 0.0
-  llm_thinking_enabled: false
-  llm_max_clusters: 10
-  llm_max_tokens: 4096
-  llm_max_attempts: 2
-  llm_retry_sleep_seconds: 2
-  cluster_similarity_threshold: 0.52
-  event_half_life_hours: 36
-  minimum_records: 3
-
 reporting:
   history_years: 5
   # directory | inline | cdn. "directory" writes plotly.min.js once next to the

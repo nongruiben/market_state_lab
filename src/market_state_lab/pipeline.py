@@ -5,7 +5,6 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-import numpy as np
 import pandas as pd
 
 from market_state_lab.config import ensure_runtime_directories, project_path
@@ -19,8 +18,6 @@ from market_state_lab.data.ibkr import ReadOnlyIBKRClient
 from market_state_lab.data.public import PublicDataBundle, PublicDataLoader
 from market_state_lab.features import build_features
 from market_state_lab.models import fit_market_state, fit_style
-from market_state_lab.news import run_news_pipeline
-from market_state_lab.news.evaluation import evaluate_news_forward
 from market_state_lab.reporting import write_dashboard
 from market_state_lab.timeutils import completed_market_clock
 
@@ -170,47 +167,6 @@ def run_pipeline(
             "point_in_time_status": bundle.point_in_time_status,
         }
     )
-    if bool(config.get("news", {}).get("enabled", False)):
-        try:
-            news = run_news_pipeline(
-                config,
-                fetch=bool(config["news"].get("fetch_on_run", False)),
-                use_llm=bool(config["news"].get("llm_enabled", True)),
-                processed_dir=processed,
-                reports_dir=reports,
-            )
-            news_evaluation = evaluate_news_forward(
-                news.daily_features, features.market["market_return"]
-            )
-            if not news_evaluation.empty:
-                news_evaluation.to_csv(reports / "news_forward_evaluation.csv", index=False)
-            if (
-                news.quality.get("status") in {"available", "session_gap_fallback"}
-                and news.quality.get("snapshot_fresh", False)
-            ):
-                latest_news = news.daily_features.iloc[-1].replace({np.nan: None}).to_dict()
-                state.latest["news_overlay"] = {
-                    "status": news.quality["status"],
-                    "as_of": news.daily_features.index[-1].date().isoformat(),
-                    "features": latest_news,
-                    "quality": news.quality,
-                    "llm": news.metadata,
-                    "used_in_state_model": False,
-                }
-            else:
-                state.latest["news_overlay"] = {
-                    "status": news.quality.get("status", "stale"),
-                    "quality": news.quality,
-                    "llm": news.metadata,
-                    "used_in_state_model": False,
-                }
-        except Exception as exc:
-            state.latest["news_overlay"] = {
-                "status": "failed",
-                "error": f"{type(exc).__name__}: {str(exc)[:500]}",
-                "used_in_state_model": False,
-            }
-
     _write_frame(bundle.macro, processed / "macro.parquet")
     _write_frame(bundle.vix, processed / "vix.parquet")
     _write_frame(bundle.ofr, processed / "ofr_fsi.parquet")
