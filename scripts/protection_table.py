@@ -337,6 +337,20 @@ def store(
         eligible_for=tuple(eligible),
         ineligibility=ineligible,
         project_root=ROOT,
+        # Anything that shapes the output belongs in the identity. The short
+        # list depends on --horizon, so two horizons are two snapshots, not one
+        # session mysteriously revising itself.
+        run_parameters={
+            "symbols": sorted({r["symbol"] for r in usable}),
+            "horizon": args.horizon,
+            "notional": args.notional,
+            "coverage": args.coverage,
+            "max_candidates": args.max_candidates,
+            "reduce_to": args.reduce_to,
+            "cash_rate": args.cash_rate,
+            "spot": args.spot,
+            "screen_limits": vars(args.limits),
+        },
     )
     revision = snapshot.manifest.get("revision", 1)
     history = latest_sessions(ROOT / "data")

@@ -288,3 +288,32 @@ def test_an_unchanged_verdict_adds_no_amendment(tmp_path) -> None:
             eligible_for=("day_end_analysis",),
         )
     assert "amendments" not in snap.manifest
+
+
+def test_a_different_run_parameter_is_a_different_snapshot(tmp_path) -> None:
+    # The short list depends on --horizon. Without the argument in the identity,
+    # two horizons over one session look like the session revising itself for no
+    # recorded reason - which is exactly how one appeared and could not be
+    # diagnosed from the archive.
+    near = write_snapshot(
+        tmp_path, "2026-09-08", {"q": _quotes()}, CONFIG,
+        run_parameters={"horizon": "30-60d"},
+    )
+    far = write_snapshot(
+        tmp_path, "2026-09-08", {"q": _quotes()}, CONFIG,
+        run_parameters={"horizon": "60-90d"},
+    )
+    assert near.snapshot_id != far.snapshot_id
+    assert far.manifest["run_parameters"]["horizon"] == "60-90d"
+    assert near.manifest["run_parameters"]["horizon"] == "30-60d"
+
+
+def test_the_same_parameters_still_resolve_to_one_snapshot(tmp_path) -> None:
+    first = write_snapshot(
+        tmp_path, "2026-09-08", {"q": _quotes()}, CONFIG, run_parameters={"horizon": "30-60d"}
+    )
+    again = write_snapshot(
+        tmp_path, "2026-09-08", {"q": _quotes()}, CONFIG, run_parameters={"horizon": "30-60d"}
+    )
+    assert again.snapshot_id == first.snapshot_id
+    assert len(list_snapshots(tmp_path)) == 1

@@ -273,6 +273,7 @@ def write_snapshot(
     eligible_for: tuple[str, ...] = (),
     ineligibility: dict[str, str] | None = None,
     project_root: Path | None = None,
+    run_parameters: dict[str, Any] | None = None,
 ) -> ValidatedSnapshot:
     """Write the tables and their manifest, and never a second time.
 
@@ -281,7 +282,11 @@ def write_snapshot(
     genuinely new day is a genuinely new directory.
     """
     root = Path(root)
-    config_fingerprint = _sha256(_canonical_json(config))
+    # Run parameters are part of the config for identity purposes. A horizon or
+    # a notional that changes the output but leaves no trace turns a deliberate
+    # second view into an unexplained revision - which happened here, and could
+    # not be diagnosed from the archive because the argument was never recorded.
+    config_fingerprint = _sha256(_canonical_json({"config": config, "run": run_parameters or {}}))
     snapshot_id = build_snapshot_id(session_date, tables, config_fingerprint)
     directory = root / "validated" / snapshot_id
     manifest_path = root / "manifests" / f"{snapshot_id}.json"
@@ -315,6 +320,7 @@ def write_snapshot(
         "changed_tables": _changed_tables(superseded, tables) if superseded else None,
         "written_at_utc": datetime.now(timezone.utc).isoformat(),
         "config_sha256": config_fingerprint,
+        "run_parameters": run_parameters or {},
         "code_sha256": code_hash(project_root) if project_root else None,
         "tables": {name: {"rows": len(f), "sha256": frame_hash(f)} for name, f in tables.items()},
         "requests": [asdict(r) for r in (requests or [])],
