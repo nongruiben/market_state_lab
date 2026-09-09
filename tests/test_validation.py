@@ -13,12 +13,16 @@ from market_state_lab.data.validation import (
     NOTE,
     QUARANTINE,
     REVIEW,
+    CorporateAction,
     QualityIssue,
+    attribute_moves,
     blocked_purposes,
     crisis_reading_is_allowed,
+    detect_stale_series,
     drop_quarantined,
     quarantined_subjects,
     summarise,
+    validate_bar_completeness,
     validate_daily_bars,
     validate_quotes,
 )
@@ -261,3 +265,86 @@ def test_a_frozen_book_collapses_the_last_outside_note_to_one_line() -> None:
 def test_the_collapsed_note_is_absent_when_nothing_trips_it() -> None:
     inside = pd.DataFrame([_quote(last=7.66)])
     assert validate_quotes(inside, frozen_book=True) == []
+
+
+# ---------------------------------------------------------------------------
+# Corporate actions: fault-injection row 3
+# ---------------------------------------------------------------------------
+
+
+def _split(effective: str, known: str, ratio: float = 4.0) -> CorporateAction:
+    return CorporateAction("SPY", "split", pd.Timestamp(effective), pd.Timestamp(known), ratio)
+
+
+def test_a_split_on_record_explains_the_gap_it_caused() -> None:
+    # A 4-for-1 quarters the price. The move is real and its cause is known.
+    frame = _bars([800.0, 200.0, 201.0])
+    moves = validate_daily_bars(frame, "SPY")
+    assert "large_price_move" in _codes(moves)
+    explained = attribute_moves(moves, [_split("2026-09-02", "2026-08-20")])
+    assert "large_price_move" not in _codes(explained)
+    cause = next(i for i in explained if i.code == "move_explained_by_corporate_action")
+    assert cause.severity == NOTE
+    assert "only its attribution is" in cause.detail
+
+
+def test_a_split_announced_afterwards_explains_nothing_yet() -> None:
+    # Attributing today's gap with tomorrow's announcement is the quietest way
+    # to build a series that was never tradeable.
+    frame = _bars([800.0, 200.0])
+    moves = validate_daily_bars(frame, "SPY")
+    late = _split("2026-09-02", known="2026-09-05")
+    still = attribute_moves(moves, [late], known_by=pd.Timestamp("2026-09-02"))
+    assert "large_price_move" in _codes(still)
+    # Once it is public, the same action explains the same gap.
+    now = attribute_moves(moves, [late], known_by=pd.Timestamp("2026-09-06"))
+    assert "move_explained_by_corporate_action" in _codes(now)
+
+
+def test_an_action_of_the_wrong_size_does_not_explain_the_move() -> None:
+    frame = _bars([800.0, 200.0])
+    moves = validate_daily_bars(frame, "SPY")
+    two_for_one = _split("2026-09-02", "2026-08-20", ratio=2.0)
+    assert "large_price_move" in _codes(attribute_moves(moves, [two_for_one]))
+
+
+def test_an_unexplained_move_keeps_its_review_status() -> None:
+    frame = _bars([770.0, 508.0])
+    moves = validate_daily_bars(frame, "SPY")
+    assert attribute_moves(moves, []) == moves
+
+
+def test_a_corporate_action_carries_both_of_its_dates() -> None:
+    action = _split("2026-09-02", "2026-08-20")
+    assert action.effective_at != action.known_at
+    with pytest.raises(ValueError, match="unknown corporate action"):
+        CorporateAction("SPY", "buyback", pd.Timestamp("2026-09-02"), pd.Timestamp("2026-09-02"))
+
+
+# ---------------------------------------------------------------------------
+# 6.1 remainder: an unfinished bar, and a series that stopped moving
+# ---------------------------------------------------------------------------
+
+
+def test_an_unfinished_bar_cannot_settle_a_day_end_label() -> None:
+    frame = _bars([770.0, 771.0])
+    assert validate_bar_completeness(frame, "SPY", session_complete=True) == []
+    open_session = validate_bar_completeness(frame, "SPY", session_complete=False)
+    assert open_session[0].severity == QUARANTINE
+    assert DAY_END in open_session[0].blocks
+    assert "still moving" in open_session[0].detail
+
+
+def test_a_series_that_stopped_moving_is_reviewed_not_rejected() -> None:
+    # A halt, a thin listing and a frozen feed look identical from here.
+    stuck = pd.Series([100.0] * 8, index=pd.date_range("2026-09-01", periods=8))
+    issue = detect_stale_series(stuck, "THIN")[0]
+    assert issue.severity == REVIEW
+    assert issue.blocks == ()
+    assert "check activity and a second source" in issue.detail
+
+
+def test_a_moving_series_is_not_flagged() -> None:
+    moving = pd.Series([100.0, 101.0, 100.5, 102.0, 101.0, 103.0],
+                       index=pd.date_range("2026-09-01", periods=6))
+    assert detect_stale_series(moving, "SPY") == []

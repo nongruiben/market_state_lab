@@ -26,6 +26,8 @@ from market_state_lab.data.reconciliation import (
 from market_state_lab.data.snapshots import default_eligibility
 from market_state_lab.data.validation import (
     DAY_END,
+    CorporateAction,
+    attribute_moves,
     blocked_purposes,
     crisis_reading_is_allowed,
     validate_daily_bars,
@@ -365,12 +367,39 @@ def test_a_raw_series_may_not_be_compared_against_an_adjusted_one() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Row 3: a split or distribution is identified and attributed, never repriced.
+# ---------------------------------------------------------------------------
+
+
+def test_a_split_is_attributed_rather_than_the_price_repaired() -> None:
+    frame = pd.DataFrame(
+        {"close": [800.0, 200.0, 201.0]}, index=pd.date_range("2026-09-01", periods=3)
+    )
+    moves = validate_daily_bars(frame, "SPY")
+    action = CorporateAction("SPY", "split", pd.Timestamp("2026-09-02"),
+                             pd.Timestamp("2026-08-20"), 4.0)
+    explained = attribute_moves(moves, [action])
+    assert any(i.code == "move_explained_by_corporate_action" for i in explained)
+    # The bar is untouched: only its attribution changed.
+    assert frame.loc[pd.Timestamp("2026-09-02"), "close"] == 200.0
+
+
+def test_an_action_not_yet_public_cannot_explain_the_day_it_lands_on() -> None:
+    frame = pd.DataFrame(
+        {"close": [800.0, 200.0]}, index=pd.date_range("2026-09-01", periods=2)
+    )
+    moves = validate_daily_bars(frame, "SPY")
+    late = CorporateAction("SPY", "split", pd.Timestamp("2026-09-02"),
+                           pd.Timestamp("2026-09-05"), 4.0)
+    assert any(
+        i.code == "large_price_move"
+        for i in attribute_moves(moves, [late], known_by=pd.Timestamp("2026-09-02"))
+    )
+
+
+# ---------------------------------------------------------------------------
 # Unbuilt rows. They stay listed until their layer lands:
 #
-# 3  split/dividend口径 mismatch  -> data/validation.py (6.3): the convention
-#                                   check catches a raw-against-adjusted
-#                                   comparison, but corporate actions are not
-#                                   yet stored with effective_at and known_at.
 # 11 historical pollution repair -> features/models: dependent features and
 #                                   state invalidated and replayed; original
 #                                   report kept.

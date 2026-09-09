@@ -31,6 +31,7 @@ it belongs to whoever reads the issues.
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -406,6 +407,10 @@ def summarise(issues: list[QualityIssue]) -> dict[str, Any]:
 
 __all__ = [
     "ALL_PURPOSES",
+    "CorporateAction",
+    "attribute_moves",
+    "detect_stale_series",
+    "validate_bar_completeness",
     "NOTE",
     "QUARANTINE",
     "REVIEW",
@@ -419,3 +424,160 @@ __all__ = [
     "validate_daily_bars",
     "validate_quotes",
 ]
+
+
+@dataclass(frozen=True)
+class CorporateAction:
+    """A split or distribution, with both dates it has.
+
+    `effective_at` is when the price changed. `known_at` is when anyone could
+    have known - and they are rarely the same day. A study that attributes a
+    gap using a split announced afterwards has used tomorrow's newspaper, which
+    is the quietest way to build a model that cannot be traded.
+    """
+
+    symbol: str
+    kind: str  # "split" | "dividend"
+    effective_at: pd.Timestamp
+    known_at: pd.Timestamp
+    ratio: float | None = None  # 4.0 for a 4-for-1 split
+    amount: float | None = None  # cash per share for a distribution
+
+    def __post_init__(self) -> None:
+        if self.kind not in {"split", "dividend"}:
+            raise ValueError(f"{self.symbol}: unknown corporate action {self.kind!r}")
+        if pd.Timestamp(self.known_at) < pd.Timestamp(self.effective_at) - pd.Timedelta(days=365):
+            raise ValueError(f"{self.symbol}: known_at implausibly precedes effective_at")
+
+    def expected_ratio(self) -> float | None:
+        """The close-to-close ratio this action alone would produce."""
+        if self.kind == "split" and self.ratio:
+            return 1.0 / float(self.ratio)
+        return None
+
+
+def attribute_moves(
+    issues: list[QualityIssue],
+    actions: list[CorporateAction],
+    known_by: pd.Timestamp | None = None,
+    tolerance: float = 0.02,
+) -> list[QualityIssue]:
+    """Explain the moves a recorded corporate action accounts for.
+
+    Only actions already public by `known_by` may explain anything. Attribution
+    is the one place where using a later fact is invisible in the output and
+    fatal to it: the series looks clean and the study looks tradeable, and it
+    never was.
+
+    An unexplained move keeps its review status. Nothing is rescaled here - the
+    point is to say which large moves have a cause on record, not to iron them
+    out.
+    """
+    explained: list[QualityIssue] = []
+    for issue in issues:
+        if issue.code != "large_price_move":
+            explained.append(issue)
+            continue
+        try:
+            symbol, stamp_text = issue.subject.split(" ", 1)
+            stamp = pd.Timestamp(stamp_text)
+        except (ValueError, TypeError):
+            explained.append(issue)
+            continue
+        cause = _matching_action(symbol, stamp, actions, known_by, tolerance, issue.detail)
+        if cause is None:
+            explained.append(issue)
+            continue
+        explained.append(
+            QualityIssue(
+                "move_explained_by_corporate_action", NOTE, issue.subject,
+                f"a {cause.kind} effective {pd.Timestamp(cause.effective_at).date()} "
+                f"(known {pd.Timestamp(cause.known_at).date()}) accounts for this; "
+                "the price is unchanged and only its attribution is",
+            )
+        )
+    return explained
+
+
+def _matching_action(
+    symbol: str,
+    stamp: pd.Timestamp,
+    actions: list[CorporateAction],
+    known_by: pd.Timestamp | None,
+    tolerance: float,
+    detail: str,
+) -> CorporateAction | None:
+    for action in actions:
+        if action.symbol != symbol:
+            continue
+        if pd.Timestamp(action.effective_at).normalize() != stamp.normalize():
+            continue
+        if known_by is not None and pd.Timestamp(action.known_at) > pd.Timestamp(known_by):
+            # Public later than the moment being judged: it explains nothing yet.
+            continue
+        expected = action.expected_ratio()
+        if expected is None:
+            return action
+        moved = _reported_move(detail)
+        if moved is None or abs((1.0 + moved) / expected - 1.0) <= tolerance:
+            return action
+    return None
+
+
+def _reported_move(detail: str) -> float | None:
+    match = re.search(r"([+-]\d+(?:\.\d+)?)%", detail)
+    return float(match.group(1)) / 100.0 if match else None
+
+
+def validate_bar_completeness(
+    frame: pd.DataFrame,
+    symbol: str,
+    session_complete: bool,
+) -> list[QualityIssue]:
+    """An unfinished session's bar may describe the day, never settle it.
+
+    It moves for the rest of the afternoon. Letting it into a day-end target
+    means the label depends on when the job happened to run.
+    """
+    if frame.empty or session_complete:
+        return []
+    return [
+        QualityIssue(
+            "last_bar_incomplete", QUARANTINE, f"{symbol} {frame.index[-1]}",
+            "the session has not closed, so this bar is still moving; it can be "
+            "observed intraday but cannot settle a day-end label",
+            (TRAINING, DAY_END),
+        )
+    ]
+
+
+def detect_stale_series(
+    series: pd.Series,
+    symbol: str,
+    repeats: int = 5,
+) -> list[QualityIssue]:
+    """A value that has not moved for days is suspicious, not wrong.
+
+    A halted listing, a holiday run, a thin bond ETF and a frozen feed all look
+    identical from here. The plan is explicit that this is a case for a second
+    source and an activity check, so it is reported and never rejected.
+    """
+    values = series.dropna()
+    if len(values) < repeats:
+        return []
+    run = (values != values.shift()).cumsum()
+    longest = values.groupby(run).size()
+    worst = int(longest.max())
+    if worst < repeats:
+        return []
+    stuck = longest.idxmax()
+    window = values[run == stuck]
+    return [
+        QualityIssue(
+            "series_not_updating", REVIEW, f"{symbol} {window.index[0]}",
+            f"{worst} consecutive identical values from {window.index[0]} to "
+            f"{window.index[-1]}; a halt, a thin listing and a frozen feed look "
+            "the same from here, so check activity and a second source",
+            (),
+        )
+    ]
