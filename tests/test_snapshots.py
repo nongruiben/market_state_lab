@@ -252,3 +252,39 @@ def test_a_superseded_revision_is_kept_not_rewritten(tmp_path) -> None:
     recovered = read_snapshot(tmp_path, first.snapshot_id)
     assert verify_snapshot(recovered) == []
     assert recovered.table("q").loc[0, "ask"] == 7.68
+
+
+def test_a_changed_verdict_on_unchanged_data_is_amended_not_frozen(tmp_path) -> None:
+    # Identity is the data, so a rule change re-runs to the same id and the write
+    # is skipped. Without an amendment the stored verdict would stay at whatever
+    # the code said the first time - which is exactly what happened once.
+    first = write_snapshot(
+        tmp_path, "2026-09-08", {"q": _quotes()}, CONFIG,
+        eligible_for=("day_end_analysis",),
+        ineligibility={"instrument_quotes": "one row QUARANTINED"},
+    )
+    second = write_snapshot(
+        tmp_path, "2026-09-08", {"q": _quotes()}, CONFIG,
+        eligible_for=("day_end_analysis", "instrument_quotes"),
+        ineligibility={},
+    )
+    assert second.snapshot_id == first.snapshot_id
+    assert second.eligible_for == ("day_end_analysis", "instrument_quotes")
+    # The verdict it replaced is dated and kept, never erased.
+    amendment = second.manifest["amendments"][0]
+    assert amendment["superseded_eligible_for"] == ["day_end_analysis"]
+    assert amendment["superseded_ineligibility"] == {"instrument_quotes": "one row QUARANTINED"}
+    assert amendment["amended_at_utc"]
+    # And it survives a reload.
+    assert read_snapshot(tmp_path, first.snapshot_id).eligible_for == (
+        "day_end_analysis", "instrument_quotes"
+    )
+
+
+def test_an_unchanged_verdict_adds_no_amendment(tmp_path) -> None:
+    for _ in range(2):
+        snap = write_snapshot(
+            tmp_path, "2026-09-08", {"q": _quotes()}, CONFIG,
+            eligible_for=("day_end_analysis",),
+        )
+    assert "amendments" not in snap.manifest

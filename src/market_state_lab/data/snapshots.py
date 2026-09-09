@@ -229,13 +229,19 @@ def build_snapshot_id(
 def default_eligibility(qualifications: set[str] | None) -> tuple[tuple[str, ...], dict[str, str]]:
     """What a post-close run may grant its snapshot, from the rows' qualifications.
 
-    The fault-injection matrix pins this: delayed or frozen data during a live
-    session must not enter a real-time instrument recommendation, and that fact
-    has to show up as an eligibility refusal rather than as a smaller table.
-    `instrument_quotes` is granted only when every screened row qualified VALID
-    - a single DEGRADED row, whatever the reason, demotes the whole snapshot,
-    because a comparison quietly missing one leg reads as "these are the
-    choices".
+    The question is whether the data could be judged, not whether the
+    instruments passed. DEGRADED and UNAVAILABLE mean a row could not be
+    assessed - a missing open interest, a frozen book while the session trades,
+    an ask that never came - and a single one of those demotes the whole
+    snapshot, because a comparison quietly missing one leg reads as "these are
+    the choices".
+
+    QUARANTINED does not demote it. A quarantined row is the screen succeeding:
+    every field arrived and the contract was confidently rejected as too thin or
+    too wide. Treating a working screen as a data fault would mean the better
+    the screen got, the less the snapshot was trusted - and the plan is explicit
+    that unfit *option data* stops contract ranking, which an unfit *contract*
+    is not.
 
     `training` is never granted by one run, and `intraday_observation` never by
     a post-close one. Both are matters of series and schedule, not of data.
@@ -244,13 +250,15 @@ def default_eligibility(qualifications: set[str] | None) -> tuple[tuple[str, ...
         "intraday_observation": "post-close run on a frozen book",
         "training": "one session; a training set is granted over a series, not a run",
     }
+    unjudged = (qualifications or set()) & {"DEGRADED", "UNAVAILABLE"}
     eligible: list[str] = ["day_end_analysis"]
-    if qualifications and qualifications <= {"VALID"}:
+    if qualifications and not unjudged:
         eligible.append("instrument_quotes")
     else:
         ineligible["instrument_quotes"] = (
-            "not every screened row qualified VALID: "
-            + (", ".join(sorted(qualifications - {"VALID"})) if qualifications else "no data")
+            ("rows that could not be judged: " + ", ".join(sorted(unjudged)))
+            if unjudged
+            else "no data"
         )
     return tuple(eligible), ineligible
 
@@ -285,6 +293,16 @@ def write_snapshot(
     prior = _session_revisions(root, session_date)
     if any(p["snapshot_id"] == snapshot_id for p in prior):
         existing = next(p for p in prior if p["snapshot_id"] == snapshot_id)
+        # The data is unchanged, so nothing is rewritten - but the verdict about
+        # it may have moved since, and leaving that frozen is its own kind of
+        # lie. Amending is the one thing this path does.
+        existing = _amend_verdict(
+            manifest_path,
+            existing,
+            list(eligible_for),
+            ineligibility or {},
+            code_hash(project_root) if project_root else None,
+        )
         return ValidatedSnapshot(snapshot_id, session_date, tables, existing)
     superseded = prior[-1] if prior else None
 
@@ -315,10 +333,49 @@ def write_snapshot(
         manifest_path.write_text(
             json.dumps(manifest, indent=2, default=str), encoding="utf-8"
         )
-    else:
+    else:  # pragma: no cover - the revision check above already returned
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
     return ValidatedSnapshot(snapshot_id, session_date, tables, manifest)
+
+
+def _amend_verdict(
+    path: Path,
+    manifest: dict[str, Any],
+    eligible_for: list[str],
+    ineligibility: dict[str, str],
+    code_sha256: str | None,
+) -> dict[str, Any]:
+    """Record a changed verdict on unchanged data, keeping the one it replaced.
+
+    Identity is the data, so a rule change re-runs to the same snapshot id and
+    the write is skipped - which would leave the stored verdict frozen at
+    whatever the code said the first time. That happened: a snapshot kept
+    "not every screened row qualified VALID: QUARANTINED" after the rule stopped
+    treating a working screen as a data fault.
+
+    The verdict is therefore amended rather than left or overwritten. The
+    superseded one is appended with the code hash that produced it, so a
+    correction is dated and visible instead of silently rewriting a past
+    conclusion.
+    """
+    if (
+        manifest.get("eligible_for") == eligible_for
+        and manifest.get("ineligibility") == ineligibility
+    ):
+        return manifest
+    manifest.setdefault("amendments", []).append(
+        {
+            "amended_at_utc": datetime.now(timezone.utc).isoformat(),
+            "code_sha256": code_sha256,
+            "superseded_eligible_for": manifest.get("eligible_for"),
+            "superseded_ineligibility": manifest.get("ineligibility"),
+        }
+    )
+    manifest["eligible_for"] = eligible_for
+    manifest["ineligibility"] = ineligibility
+    path.write_text(json.dumps(manifest, indent=2, default=str), encoding="utf-8")
+    return manifest
 
 
 def read_snapshot(root: Path, snapshot_id: str) -> ValidatedSnapshot:

@@ -85,6 +85,20 @@ def test_one_degraded_row_removes_the_realtime_recommendation_eligibility() -> N
     assert "DEGRADED" in ineligible["instrument_quotes"]
 
 
+def test_a_working_screen_does_not_count_as_a_data_fault() -> None:
+    # A quarantined contract is the screen succeeding: every field arrived and
+    # the instrument was confidently rejected as too thin. If that demoted the
+    # snapshot, the better the screen got the less the data would be trusted.
+    eligible, _ = default_eligibility({"VALID", "QUARANTINED"})
+    assert "instrument_quotes" in eligible
+
+
+def test_an_unavailable_row_still_demotes_the_snapshot() -> None:
+    eligible, ineligible = default_eligibility({"VALID", "UNAVAILABLE"})
+    assert "instrument_quotes" not in eligible
+    assert "UNAVAILABLE" in ineligible["instrument_quotes"]
+
+
 def test_a_fully_valid_book_keeps_its_recommendation_eligibility() -> None:
     eligible, _ = default_eligibility({"VALID"})
     assert "instrument_quotes" in eligible

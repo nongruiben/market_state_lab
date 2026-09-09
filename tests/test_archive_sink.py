@@ -78,3 +78,82 @@ def test_rewriting_the_same_request_with_different_bytes_raises(tmp_path) -> Non
     sink.complete(record, {"skew_seconds": 0.2})
     with pytest.raises(FileExistsError, match="revision"):
         sink.complete(record, {"skew_seconds": -0.4})
+
+
+class _FakeTicker:
+    """Only what the retry path reads."""
+
+    def __init__(self, put_oi=float("nan"), call_oi=float("nan")):
+        self.putOpenInterest = put_oi  # noqa: N803 - mirrors ib_async
+        self.callOpenInterest = call_oi  # noqa: N803
+
+
+class _FakeIB:
+    """Records what was re-subscribed, and hands back what it was told to."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.requested: list[tuple] = []
+        self.cancelled: list = []
+
+    def reqMktData(self, contract, ticks, *_):  # noqa: N802 - mirrors ib_async
+        self.requested.append((contract, ticks))
+        return self.answers[contract]
+
+    def sleep(self, _seconds):
+        return None
+
+    def cancelMktData(self, contract):  # noqa: N802 - mirrors ib_async
+        self.cancelled.append(contract)
+
+
+def _client_with(fake, tmp_path):
+    from market_state_lab.data.ibkr import ArchiveSink, ReadOnlyIBKRClient
+
+    client = ReadOnlyIBKRClient.__new__(ReadOnlyIBKRClient)
+    client.ib = fake
+    client._require = lambda: fake
+    client.archive = ArchiveSink(tmp_path, session_tag="g")
+    return client
+
+
+def test_a_missing_open_interest_is_re_asked_for_and_filled(tmp_path) -> None:
+    fake = _FakeIB({"c1": _FakeTicker(put_oi=9695.0)})
+    client = _client_with(fake, tmp_path)
+    rows = [{"sec_type": "OPT", "right": "P", "con_id": 1, "open_interest": None}]
+    client._retry_open_interest([(0, "c1")], rows, 0.0, attempt=1)
+    assert rows[0]["open_interest"] == 9695.0
+    # Chasing is visible: a value that needed a second ask says so.
+    assert rows[0]["open_interest_attempt"] == 1
+    # Only tick 101 is re-requested, and the line is closed again.
+    assert fake.requested == [("c1", "101")]
+    assert fake.cancelled == ["c1"]
+
+
+def test_what_never_arrives_stays_absent_rather_than_becoming_zero(tmp_path) -> None:
+    fake = _FakeIB({"c1": _FakeTicker()})  # still nothing
+    client = _client_with(fake, tmp_path)
+    rows = [{"sec_type": "OPT", "right": "P", "con_id": 1, "open_interest": None}]
+    client._retry_open_interest([(0, "c1")], rows, 0.0, attempt=1)
+    assert rows[0]["open_interest"] is None
+    assert "open_interest_attempt" not in rows[0]
+
+
+def test_the_retry_reads_the_side_matching_the_contract(tmp_path) -> None:
+    # A put's callOpenInterest is 0 by construction, not a fact about the market.
+    fake = _FakeIB({"c1": _FakeTicker(put_oi=float("nan"), call_oi=0.0)})
+    client = _client_with(fake, tmp_path)
+    rows = [{"sec_type": "OPT", "right": "P", "con_id": 1, "open_interest": None}]
+    client._retry_open_interest([(0, "c1")], rows, 0.0, attempt=1)
+    assert rows[0]["open_interest"] is None
+
+
+def test_the_retry_is_archived_as_its_own_request(tmp_path) -> None:
+    fake = _FakeIB({"c1": _FakeTicker(put_oi=120.0)})
+    client = _client_with(fake, tmp_path)
+    rows = [{"sec_type": "OPT", "right": "P", "con_id": 1, "open_interest": None}]
+    client._retry_open_interest([(0, "c1")], rows, 0.0, attempt=1)
+    record = client.archive.records[-1]
+    assert record.parameters["purpose"] == "open_interest_retry"
+    assert record.parameters["attempt"] == 1
+    assert record.state == "complete" and record.rows == 1

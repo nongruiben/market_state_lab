@@ -310,6 +310,7 @@ class ReadOnlyIBKRClient:
         contracts: list[Any],
         wait_seconds: float = 12.0,
         generic_ticks: str | None = None,
+        open_interest_retries: int = 1,
     ) -> pd.DataFrame:
         """Streaming quotes carrying their own status, times and actual data type.
 
@@ -331,6 +332,22 @@ class ReadOnlyIBKRClient:
         and none is used to value anything; open interest is the one a liquidity
         screen can lean on, and it arrives late or not at all, which is why the
         absent case is kept distinct from a genuine zero.
+
+        `open_interest_retries` re-asks only for the legs whose open interest
+        never came, because on a real run half of them do not: three of six SPY
+        puts came back without it, which cost the whole snapshot its
+        instrument-quote eligibility and left those rows' liquidity unjudgeable.
+        A bounded retry is the plan's remedy for a partial return - and only a
+        remedy for the fetch. What is still missing after the budget stays
+        missing and the row stays degraded; retrying is not a fix, and a value
+        that never arrived is never inferred.
+
+        Only the open-interest fields are taken from the retry. Prices are left
+        at their first reading, because a second read is a second moment and
+        mixing the two is precisely the error that once paired a Tuesday spot
+        with a Friday option book. Open interest is an end-of-day figure that
+        does not move intraday, so it is the one field a later read can supply
+        without changing which moment the row describes.
         """
         if generic_ticks is None:
             generic_ticks = (
@@ -357,7 +374,57 @@ class ReadOnlyIBKRClient:
             for contract in contracts:
                 ib.cancelMktData(contract)
         self.archive.complete(record, rows, rows=len(rows))
+
+        for attempt in range(1, open_interest_retries + 1):
+            pending = [
+                (index, contract)
+                for index, (contract, row) in enumerate(zip(contracts, rows))
+                if row["sec_type"] == "OPT" and row["open_interest"] is None
+            ]
+            if not pending:
+                break
+            self._retry_open_interest(pending, rows, wait_seconds, attempt)
         return pd.DataFrame(rows)
+
+    def _retry_open_interest(
+        self,
+        pending: list[tuple[int, Any]],
+        rows: list[dict[str, Any]],
+        wait_seconds: float,
+        attempt: int,
+    ) -> None:
+        """Re-ask for the open interest that did not arrive, and record the ask."""
+        ib = self._require()
+        contracts = [contract for _, contract in pending]
+        record = self.archive.begin(
+            "reqMktData",
+            contract=[_contract_identity(c) for c in contracts],
+            parameters={
+                "genericTicks": "101",
+                "wait_seconds": wait_seconds,
+                "purpose": "open_interest_retry",
+                "attempt": attempt,
+            },
+        )
+        tickers = [ib.reqMktData(c, "101", False, False) for c in contracts]
+        try:
+            ib.sleep(wait_seconds)
+            filled: list[dict[str, Any]] = []
+            for (index, _), ticker in zip(pending, tickers):
+                right = rows[index].get("right") or ""
+                value = _clean(
+                    ticker.putOpenInterest if right == "P" else ticker.callOpenInterest
+                )
+                # Untouched when still absent: the row keeps saying it does not
+                # know, which a screen must treat differently from a zero.
+                if value is not None:
+                    rows[index]["open_interest"] = value
+                    rows[index]["open_interest_attempt"] = attempt
+                    filled.append({"con_id": rows[index]["con_id"], "open_interest": value})
+        finally:
+            for contract in contracts:
+                ib.cancelMktData(contract)
+        self.archive.complete(record, filled, rows=len(filled))
 
     def _quote_row(self, ticker: Any, received: datetime) -> dict[str, Any]:
         """One ticker to one row, carrying what a reader needs to discount it."""
@@ -434,6 +501,9 @@ class ReadOnlyIBKRClient:
             # screen must treat differently from a contract nobody holds.
             "open_interest": _clean(open_interest),
             "option_volume": _clean(option_volume),
+            # 0 = it arrived on the first ask; a retry stamps its own attempt
+            # number, so a value that needed chasing is visible as one.
+            "open_interest_attempt": 0,
         }
 
     def historical_daily_bars(
