@@ -1,0 +1,149 @@
+{
+  "experiments": [
+    {
+      "name": "state_ensemble_vs_persistence",
+      "capability": "risk_identification",
+      "hypothesis": "the calibrated state ensemble forecasts 20-session volatility state better than last-settled-tercile persistence",
+      "event": {
+        "name": "drawdown_5pct_20_sessions",
+        "horizon_sessions": 20,
+        "drawdown_threshold": 0.05,
+        "frozen_on": "2026-09-09",
+        "note": "a research definition, not an investment budget"
+      },
+      "benchmarks": [
+        "no_new_defense",
+        "fixed_low_exposure",
+        "trailing_or_ewma_volatility_target",
+        "fixed_long_term_trend_rule"
+      ],
+      "frozen_on": "2026-09-09",
+      "family": "closed-findings",
+      "family_size": 4,
+      "primary_metric": "forward Brier against the strongest benchmark",
+      "sacrifice_budget": "not applicable; none reached a stage where a budget mattered",
+      "grade": "computed_correctly",
+      "outcome": "evidence_of_harm",
+      "evidence": [],
+      "notes": [
+        "Brier 0.5721 against persistence at 0.5134 on the common day set; the ensemble is worse, not merely unproven"
+      ]
+    },
+    {
+      "name": "state_on_top_of_persistence",
+      "capability": "risk_identification",
+      "hypothesis": "adding the state layer on top of persistence improves the forecast",
+      "event": {
+        "name": "drawdown_5pct_20_sessions",
+        "horizon_sessions": 20,
+        "drawdown_threshold": 0.05,
+        "frozen_on": "2026-09-09",
+        "note": "a research definition, not an investment budget"
+      },
+      "benchmarks": [
+        "no_new_defense",
+        "fixed_low_exposure",
+        "trailing_or_ewma_volatility_target",
+        "fixed_long_term_trend_rule"
+      ],
+      "frozen_on": "2026-09-09",
+      "family": "closed-findings",
+      "family_size": 4,
+      "primary_metric": "forward Brier against the strongest benchmark",
+      "sacrifice_budget": "not applicable; none reached a stage where a budget mattered",
+      "grade": "computed_correctly",
+      "outcome": "evidence_of_harm",
+      "evidence": [],
+      "notes": [
+        "worse by 0.0995 to 0.126 across variants, every comparison significant and every one the wrong way; refitting on persistence alone cost 0.148"
+      ]
+    },
+    {
+      "name": "state_drawdown_edge",
+      "capability": "action_value",
+      "hypothesis": "state-driven exposure reduces drawdown beyond what the de-leveraging alone would give",
+      "event": {
+        "name": "drawdown_5pct_20_sessions",
+        "horizon_sessions": 20,
+        "drawdown_threshold": 0.05,
+        "frozen_on": "2026-09-09",
+        "note": "a research definition, not an investment budget"
+      },
+      "benchmarks": [
+        "no_new_defense",
+        "fixed_low_exposure",
+        "trailing_or_ewma_volatility_target",
+        "fixed_long_term_trend_rule"
+      ],
+      "frozen_on": "2026-09-09",
+      "family": "closed-findings",
+      "family_size": 4,
+      "primary_metric": "forward Brier against the strongest benchmark",
+      "sacrifice_budget": "not applicable; none reached a stage where a budget mattered",
+      "grade": "computed_correctly",
+      "outcome": "insufficient_evidence",
+      "evidence": [],
+      "notes": [
+        "significant against vol_only at every haircut, and not significant at any against an exposure-matched control; CI [-0.0061, +0.0087] at 0.65"
+      ]
+    },
+    {
+      "name": "long_horizon_predictors",
+      "capability": "risk_identification",
+      "hypothesis": "predictors that fade at 20 sessions recover at 126",
+      "event": {
+        "name": "drawdown_5pct_20_sessions",
+        "horizon_sessions": 20,
+        "drawdown_threshold": 0.05,
+        "frozen_on": "2026-09-09",
+        "note": "a research definition, not an investment budget"
+      },
+      "benchmarks": [
+        "no_new_defense",
+        "fixed_low_exposure",
+        "trailing_or_ewma_volatility_target",
+        "fixed_long_term_trend_rule"
+      ],
+      "frozen_on": "2026-09-09",
+      "family": "closed-findings",
+      "family_size": 4,
+      "primary_metric": "forward Brier against the strongest benchmark",
+      "sacrifice_budget": "not applicable; none reached a stage where a budget mattered",
+      "grade": "computed_correctly",
+      "outcome": "evidence_of_harm",
+      "evidence": [],
+      "notes": [
+        "every predictor significant in 2000-2013 and none in 2013-2026, a window containing 2015, 2018, 2020 and 2022"
+      ]
+    },
+    {
+      "name": "trend_rule_vs_drawdown_event_replay_v1",
+      "capability": "risk_identification",
+      "hypothesis": "the trend rule warns of 5% drawdowns within 20 sessions better than a frequency-matched volatility rule, within a monthly-frequency budget",
+      "event": {
+        "name": "drawdown_5pct_20_sessions",
+        "horizon_sessions": 20,
+        "drawdown_threshold": 0.05,
+        "frozen_on": "2026-09-09",
+        "note": "a research definition, not an investment budget"
+      },
+      "benchmarks": [
+        "no_new_defense",
+        "fixed_low_exposure",
+        "trailing_or_ewma_volatility_target",
+        "fixed_long_term_trend_rule"
+      ],
+      "frozen_on": "2026-09-09",
+      "family": "trend-rule-replays",
+      "family_size": 1,
+      "primary_metric": "episode recall at <= 12 confirmed signals per year",
+      "sacrifice_budget": "not reached: risk identification, not action value",
+      "grade": "computed_correctly",
+      "outcome": "evidence_of_harm",
+      "evidence": [],
+      "notes": [
+        "test recall 0.36 below the frequency-matched vol rule's 0.52 (-0.15)"
+      ]
+    }
+  ]
+}

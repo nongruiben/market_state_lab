@@ -259,11 +259,13 @@ class Registry:
 
 
 def open_registry() -> Registry:
-    """The registry as it actually stands: the closed findings, and nothing promoted.
+    """The registry as it actually stands: the closed findings plus whatever
+    replays have been recorded on this machine.
 
-    These are recorded so the next attempt starts from what is known rather than
-    rediscovering it. Every one of them is an `evidence_of_harm` or an
-    `insufficient_evidence`, and none has ever left the first rung.
+    The closed findings are recorded so the next attempt starts from what is
+    known rather than rediscovering it. A replay run (scripts/replay_trend_rule.py)
+    persists its record to data/research_registry.json, and it is merged here so
+    the report's registry summary reflects experiments actually run.
     """
     registry = Registry()
     closed = [
@@ -316,6 +318,14 @@ def open_registry() -> Registry:
             sacrifice_budget="not applicable; none reached a stage where a budget mattered",
         )
         registry.register(record_outcome(experiment, outcome, detail))
+
+    from market_state_lab.config import PROJECT_ROOT
+
+    persisted = PROJECT_ROOT / "data" / "research_registry.json"
+    if persisted.exists():
+        for experiment in Registry.load(persisted).experiments:
+            if not any(e.name == experiment.name for e in registry.experiments):
+                registry.register(experiment)
     return registry
 
 

@@ -37,7 +37,11 @@ from market_state_lab.data.reconciliation import summarise as reconciliation_sum
 from market_state_lab.data.snapshots import latest_sessions, read_snapshot
 from market_state_lab.data.validation import issues_frame, validate_daily_bars
 from market_state_lab.data.validation import summarise as quality_summary
-from market_state_lab.evaluation import compare_against_benchmarks
+from market_state_lab.evaluation import (
+    compare_against_benchmarks,
+    conditional_frequencies,
+    current_target_exposures,
+)
 from market_state_lab.events import EventLog, EventRules
 from market_state_lab.main_report import ReportInputs, build_report, render_html, render_markdown
 from market_state_lab.market_assessment import assess, state_labels
@@ -242,6 +246,10 @@ def run_pipeline(
     issues = validate_daily_bars(pd.DataFrame({"close": spy}), "SPY") if not spy.empty else []
     reconciliation = _cross_source(config, bundle, spy, with_ibkr)
     benchmarks = compare_against_benchmarks(spy) if len(spy) > 300 else pd.DataFrame()
+    reference_exposure = current_target_exposures(spy) if len(spy) > 300 else {}
+    conditionals = conditional_frequencies(spy) if len(spy) > 300 else {}
+    registry = open_registry()
+    registry_summary = registry.summary()
 
     events_path = root / "data" / ("events_offline.json" if offline else "events.json")
     log = EventLog.load(events_path, EventRules())
@@ -265,6 +273,9 @@ def run_pipeline(
             controls=protection["controls"],
             reference_notional=notional,
             reconciliation=reconciliation,
+            reference_exposure=reference_exposure,
+            conditionals=conditionals,
+            registry_summary=registry_summary,
         )
     )
 
@@ -278,7 +289,6 @@ def run_pipeline(
     run_id = f"{session}-{datetime.now(timezone.utc).strftime('%H%M%SZ')}"
     out = reports / run_id
     out.mkdir(parents=True, exist_ok=True)
-    registry = open_registry().summary()
 
     (out / "run_manifest.json").write_text(json.dumps({
         "run_id": run_id,
@@ -288,7 +298,7 @@ def run_pipeline(
         "reference_notional_usd": notional,
         "protection_snapshot": protection["snapshot_id"],
         "approved_uses": list(protection["eligible"]),
-        "research_registry": registry,
+        "research_registry": registry_summary,
         "runtime": clock.as_dict(),
     }, indent=2, default=str), encoding="utf-8")
     (out / "data_quality_summary.json").write_text(
@@ -313,6 +323,10 @@ def run_pipeline(
     (out / "report.md").write_text(render_markdown(report), encoding="utf-8")
     (out / "report.html").write_text(
         render_html(report, f"Market state {session}"), encoding="utf-8"
+    )
+    (out / "report_zh.md").write_text(render_markdown(report, "zh"), encoding="utf-8")
+    (out / "report_zh.html").write_text(
+        render_html(report, f"市场状态 {session}", "zh"), encoding="utf-8"
     )
     manifest.to_csv(out / "data_manifest.csv", index=False)
 

@@ -9,6 +9,7 @@ import pytest
 
 from market_state_lab.evaluation import (
     BENCHMARKS,
+    EWMA_TARGET,
     FIXED_LOW_EXPOSURE,
     NO_NEW_DEFENSE,
     TREND_RULE,
@@ -41,9 +42,13 @@ def _prices(seed: int = 11, vol: float = 0.01) -> pd.Series:
 
 def test_the_ledger_computes_exactly_the_benchmarks_the_registry_requires() -> None:
     # A bar that is named in one place and measured in another under a different
-    # name is not the same bar.
-    assert set(BENCHMARKS) == set(REQUIRED_BENCHMARKS)
-    assert set(benchmark_exposures(_prices()).columns) == set(REQUIRED_BENCHMARKS)
+    # name is not the same bar. The registry names the volatility-target family
+    # ("trailing_or_ewma"); the ledger computes both members, so the invariant is
+    # containment plus the family member being present.
+    assert set(REQUIRED_BENCHMARKS) <= set(BENCHMARKS)
+    columns = set(benchmark_exposures(_prices()).columns)
+    assert set(REQUIRED_BENCHMARKS) <= columns
+    assert EWMA_TARGET in columns
 
 
 # ---------------------------------------------------------------------------

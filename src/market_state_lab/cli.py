@@ -35,10 +35,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "ibkr-check":
         symbols = [symbol.strip().upper() for symbol in args.symbols.split(",") if symbol.strip()]
         with ReadOnlyIBKRClient(config) as client:
-            print(f"TWS server time: {client.server_clock().isoformat()}")
-            print(client.delayed_snapshots(symbols).to_string())
-            if not client.errors.empty:
-                print(client.errors.to_string(index=False))
+            clock = client.server_clock()
+            print(f"TWS server time: {clock['server_time_utc']}  "
+                  f"skew {clock['skew_seconds']:+.2f}s")
+            contracts = [client.qualify_stock(symbol) for symbol in symbols]
+            print(client.quotes(contracts).to_string())
+            for record in client.archive.records:
+                if record.state == "failed":
+                    print(f"failed request {record.request_id}: {record.error}")
         return 0
     outputs = run_pipeline(config, with_ibkr=args.with_ibkr, offline=args.offline)
     print(json.dumps({name: str(path) for name, path in outputs.items()}, indent=2))

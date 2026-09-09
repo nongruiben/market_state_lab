@@ -15,7 +15,7 @@ def run_diagnostics(config: dict[str, Any]) -> pd.DataFrame:
     rows: list[dict[str, str]] = []
     for package in (
         "numpy", "pandas", "pyarrow", "yaml", "requests", "sklearn", "scipy",
-        "hmmlearn", "exchange_calendars", "plotly",
+        "exchange_calendars",
     ):
         installed = importlib.util.find_spec(package) is not None
         rows.append({"check": f"dependency:{package}", "status": "ok" if installed else "failed", "detail": ""})
@@ -43,17 +43,24 @@ def run_diagnostics(config: dict[str, Any]) -> pd.DataFrame:
     pipeline_source = (PROJECT_ROOT / "src" / "market_state_lab" / "pipeline.py").read_text(
         encoding="utf-8"
     )
+    # The gate that actually exists: no client is constructed before the
+    # with_ibkr early return, and the snapshot client sits inside `if with_ibkr:`.
+    # Two constructions is correct - one cross-source, one snapshot - so the old
+    # "== 1" count reported failure on the very refactor that kept the invariant.
     gated = (
-        pipeline_source.count("ReadOnlyIBKRClient(") == 1
+        pipeline_source.count("ReadOnlyIBKRClient(") == 2
         and "if with_ibkr:" in pipeline_source
-        and pipeline_source.index("state = fit_market_state")
+        and "if not with_ibkr" in pipeline_source
+        and pipeline_source.index("if not with_ibkr")
+        < pipeline_source.index("ReadOnlyIBKRClient(")
+        and pipeline_source.index("ReadOnlyIBKRClient(")
         < pipeline_source.index("if with_ibkr:")
     )
     rows.append(
         {
             "check": "ibkr:connection_requires_explicit_flag",
             "status": "ok" if gated else "failed",
-            "detail": f"single client behind --with-ibkr, after the model runs; enabled={enabled}",
+            "detail": f"both clients behind the with_ibkr gate; enabled={enabled}",
         }
     )
 
@@ -112,15 +119,37 @@ def run_diagnostics(config: dict[str, Any]) -> pd.DataFrame:
             }
         )
 
-    feature_path = PROJECT_ROOT / "data" / "processed" / "market_features.parquet"
-    if feature_path.exists():
-        features = pd.read_parquet(feature_path)
-        usable = int((features.notna().sum() >= 120).sum())
+    # The old check read market_features.parquet, an artefact the forecasting
+    # pipeline used to write and nothing writes now - it passed on stale data or
+    # failed on an empty file, both for the wrong reason. The evidence layer
+    # needs SPY closes, so that is what this checks.
+    processed_path = PROJECT_ROOT / "data" / "processed" / "etf_close.parquet"
+    if processed_path.exists():
+        closes = pd.read_parquet(processed_path)
+        if "spy" in closes.columns:
+            usable = int(closes["spy"].notna().sum())
+            latest = str(closes["spy"].dropna().index.max().date()) if usable else "none"
+            rows.append(
+                {
+                    "check": "evidence:spy_history",
+                    "status": "ok" if usable >= 252 else "failed",
+                    "detail": f"{usable} closes, latest {latest}",
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "check": "evidence:spy_history",
+                    "status": "failed",
+                    "detail": "etf_close.parquet has no spy column",
+                }
+            )
+    else:
         rows.append(
             {
-                "check": "model:usable_feature_count",
-                "status": "ok" if usable >= 3 else "failed",
-                "detail": str(usable),
+                "check": "evidence:spy_history",
+                "status": "warning",
+                "detail": "run the pipeline once to create data/processed/etf_close.parquet",
             }
         )
 

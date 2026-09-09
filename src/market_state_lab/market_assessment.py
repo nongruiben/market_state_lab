@@ -178,31 +178,91 @@ def state_labels(evidence: MarketEvidence, rules: RuleSet = DEFAULT_RULES) -> li
     return labels
 
 
+def derive_leaning(
+    labels: set[str],
+    rules: RuleSet = DEFAULT_RULES,
+) -> tuple[str, str]:
+    """The section 9.2 mapping from labels to a conditional leaning.
+
+    Only reached when the rules carry a measured grade; at `UNTESTED` the
+    answer is pre-registered as insufficient and this function is not consulted.
+    The mapping is coarse on purpose: it turns descriptions into "consider
+    looking", never into "the evidence proves you should trade".
+
+    - Trend damaged AND one independent dimension also deteriorated: consider
+      reducing market exposure, protection compared alongside.
+    - Short-term stress without long-term damage: compare limited-term
+      protection against watching.
+    - Repair underway while damage persists: conflicted, read both.
+    - Repair with nothing worsening: watch; no automatic re-entry signal.
+    - Nothing notable: no new defense case, which is not a forecast of safety.
+    """
+    worsening = TREND_DAMAGED in labels or VOLATILITY_ELEVATED in labels or STRESS_SPREADING in labels
+    if TREND_DAMAGED in labels and len(labels & {VOLATILITY_ELEVATED, STRESS_SPREADING}) >= 1:
+        return REVIEW_REDUCTION, (
+            "trend damage is confirmed by a second, independent dimension; "
+            "consider lowering market exposure, with protection compared alongside"
+        )
+    # Conflict is checked before the hedge branch: repair plus any standing
+    # damage is a contradiction, whatever the damage is.
+    if REPAIR_UNDERWAY in labels and worsening:
+        return CONFLICTED, "repair signals conflict with still-standing damage; read both"
+    if VOLATILITY_ELEVATED in labels and TREND_DAMAGED not in labels and STRESS_SPREADING not in labels:
+        return REVIEW_HEDGE, (
+            "short-term stress is elevated while the long trend is not damaged; "
+            "compare limited-term protection against watching"
+        )
+    if worsening:
+        return WATCH, "one dimension is notable; not yet enough to change exposure"
+    if REPAIR_UNDERWAY in labels:
+        return WATCH, "risk has eased; this is not a re-entry signal"
+    return NO_NEW_DEFENSE_CASE, (
+        "nothing notable deteriorated; this is not a forecast of safety, "
+        "and uncovered risks remain"
+    )
+
+
 def assess(
     evidence: MarketEvidence,
     rules: RuleSet = DEFAULT_RULES,
     snapshot_id: str | None = None,
     observation_horizon: str = "20 sessions",
 ) -> Assessment:
-    """Describe the state and decline to lean.
+    """Describe the state, and lean only behind a grade that was earned.
 
-    The leaning is `DATA_INSUFFICIENT` by pre-registration, not by accident and
-    not because today's data was thin. It stays there until a rule reaches a
-    grade above untested, which no rule in this project ever has.
+    At `UNTESTED` the leaning is `DATA_INSUFFICIENT` by pre-registration, not
+    by accident and not because today's data was thin. A rule set that has been
+    promoted to a measured grade answers through `derive_leaning`.
     """
     disagreements = contradictions(evidence)
     labels = state_labels(evidence, rules)
+    # Oriented rank: for indicators where lower is riskier, the raw percentile
+    # would show 70% in the list of things supporting a risk reading when the
+    # oriented risk rank is 30% - the exact misreading the Indicator boundary
+    # text warns about.
     basis = [
-        f"{i.name} at the {i.percentile:.0%} rank of its own history "
-        f"({i.value:.2f} {i.unit})"
+        f"{i.name} risk rank {i.risk_rank:.0%} "
+        f"({i.value:.2f} {i.unit}, {i.percentile:.0%} of history more favourable)"
         for i in evidence.indicators
-        if i.value is not None and i.percentile is not None and i.direction == DETERIORATING
+        if i.value is not None and i.risk_rank is not None and i.direction == DETERIORATING
     ]
     contrary = [
         f"{i.name} improved over 20 sessions"
         for i in evidence.indicators
         if i.value is not None and i.direction == "improving"
     ] + [d["detail"] for d in disagreements]
+
+    leaning = DATA_INSUFFICIENT
+    reason = (
+        "Pre-registered. The forecasting ability a leaning needs was measured on "
+        "this project's data and is absent: Brier 0.5721 against persistence at "
+        "0.5134 over 20 days, the drawdown edge gone under an exposure-matched "
+        "control, no predictor significant after 2013 at 126 days, five feature "
+        "families null. This is the expected answer, not a shortfall of today's "
+        "data, and it changes only when a rule passes the promotion gate."
+    )
+    if rules.grade != UNTESTED:
+        leaning, reason = derive_leaning(set(labels), rules)
 
     return Assessment(
         as_of=evidence.as_of,
@@ -211,15 +271,8 @@ def assess(
         state_labels=labels,
         risk_basis=basis,
         contrary_evidence=contrary,
-        action_leaning=DATA_INSUFFICIENT,
-        leaning_reason=(
-            "Pre-registered. The forecasting ability a leaning needs was measured on "
-            "this project's data and is absent: Brier 0.5721 against persistence at "
-            "0.5134 over 20 days, the drawdown edge gone under an exposure-matched "
-            "control, no predictor significant after 2013 at 126 days, five feature "
-            "families null. This is the expected answer, not a shortfall of today's "
-            "data, and it changes only when a rule passes the promotion gate."
-        ),
+        action_leaning=leaning,
+        leaning_reason=reason,
         applicable_conditions=[
             "Reducing exposure and buying protection answer different preferences: "
             "how much upside you are willing to give up, and how much you will pay "
@@ -273,6 +326,7 @@ __all__ = [
     "Assessment",
     "RuleSet",
     "assess",
+    "derive_leaning",
     "promote",
     "report",
     "state_labels",

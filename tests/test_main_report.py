@@ -112,7 +112,7 @@ def test_insufficient_evidence_renders_as_a_result_not_a_failure() -> None:
     markdown = render_markdown(report)
     assert "DATA_INSUFFICIENT" in markdown
     for word in ("error", "failed", "unavailable"):
-        assert word not in markdown.lower().split("## 2. market reading")[1][:600]
+        assert word not in markdown.lower().split("## 2. what this means for a position")[1][:600]
 
 
 def test_no_qualifying_instrument_is_stated_and_the_controls_still_compare() -> None:
@@ -202,9 +202,10 @@ def test_a_quiet_session_says_nothing_changed() -> None:
 def test_the_markdown_carries_every_section_heading() -> None:
     markdown = render_markdown(build_report(_inputs(candidates=_candidates())))
     for heading in (
-        "## 1. Data status", "## 2. Market reading", "## 3. Since last time",
-        "## 4. Dimensions", "## 5. Reduce or protect",
-        "## 6. Payoff against the reference exposure", "## 7. What would change this",
+        "## 1. Data status", "## 2. What this means for a position",
+        "## 3. Since last time", "## 4. Dimensions", "## 5. Reduce or protect",
+        "## 6. Payoff against the reference exposure",
+        "## 7. What would change this, and the method behind it",
     ):
         assert heading in markdown
 

@@ -57,6 +57,9 @@ class ReportInputs:
     controls: list[dict[str, Any]] = field(default_factory=list)
     reference_notional: float = 100_000.0
     reconciliation: dict[str, Any] | None = None
+    reference_exposure: dict[str, Any] = field(default_factory=dict)
+    conditionals: dict[str, Any] = field(default_factory=dict)
+    registry_summary: dict[str, Any] = field(default_factory=dict)
 
 
 def _data_status(inputs: ReportInputs) -> dict[str, Any]:
@@ -91,6 +94,12 @@ def _judgment(inputs: ReportInputs) -> dict[str, Any]:
         "supporting_withheld": max(0, len(assessment.risk_basis) - MAX_EVIDENCE_ITEMS),
         "contrary_withheld": max(0, len(assessment.contrary_evidence) - MAX_EVIDENCE_ITEMS),
         "normal_outcome": assessment.action_leaning == DATA_INSUFFICIENT,
+        # The one number with a measured history behind it: the volatility
+        # target never predicts, and its 26-year ledger is on record.
+        "reference_exposure": inputs.reference_exposure,
+        # Causal frequencies of the research event around today's state - the
+        # operational answer a percentile cannot give.
+        "conditionals": inputs.conditionals,
     }
 
 
@@ -205,6 +214,7 @@ def _review(inputs: ReportInputs) -> dict[str, Any]:
         "next_review_reason": inputs.assessment.next_review_reason,
         "research_grade": inputs.assessment.research_grade,
         "applicable_conditions": inputs.assessment.applicable_conditions,
+        "research_registry": inputs.registry_summary,
     }
 
 
@@ -254,8 +264,344 @@ def _sections(inputs: ReportInputs) -> dict[str, Any]:
     }
 
 
-def render_markdown(report: dict[str, Any]) -> str:
-    """A templated rendering. No sentence here is generated from the numbers."""
+def _leaning_zh(leaning: str) -> str:
+    return {
+        "NO_NEW_DEFENSE_CASE": "无新增防御依据",
+        "WATCH": "观察",
+        "REVIEW_REDUCTION": "考虑减仓",
+        "REVIEW_HEDGE": "考虑保护",
+        "CONFLICTED": "证据冲突",
+        "DATA_INSUFFICIENT": "证据不足",
+    }.get(leaning, leaning)
+
+
+def _state_zh(label: str) -> str:
+    return {
+        "trend_damaged": "趋势受损",
+        "volatility_elevated": "波动升高",
+        "stress_spreading": "压力扩散",
+        "repair_underway": "修复进行中",
+        "none of the state labels currently fit": "当前没有任何状态标签适用",
+    }.get(label, label)
+
+
+_DIMENSION_ZH = {
+    "trend": "趋势",
+    "volatility": "波动",
+    "participation": "参与面",
+    "credit": "信用",
+    "implied_risk": "隐含风险",
+}
+_DIRECTION_ZH = {"deteriorating": "恶化", "improving": "改善", "stable": "平稳"}
+_UNIT_ZH = {
+    "% above the 200-session average": "% 高于200日均线",
+    "% over 63 sessions": "% 63个交易日变化",
+    "% below the 252-session high": "% 低于252日高点",
+    "% annualised": "% 年化",
+    "ratio": "比值",
+    "percentage points": "个百分点",
+    "index points": "指数点位",
+}
+
+# The pre-registered insufficient-evidence paragraph, in both languages. The
+# English text is what assess() stores; the Chinese text is its translation,
+# fixed here rather than generated so the two cannot drift in meaning.
+_PRE_REGISTERED_REASON_ZH = (
+    "预先登记。做出行动倾向所需的预测能力已在本项目的数据上被测量过,且不存在:"
+    "20 日波动率状态上校准集成的 Brier 为 0.5721,而持续性基准是 0.5134;"
+    "回撤优势在等仓位对照下消失;126 日上没有预测器在 2013 年后显著;"
+    "连续五个特征家族返回空值。这是预期答案,不是今天数据不足,"
+    "只有当某条规则通过晋级闸门后它才会改变。"
+)
+
+_LEANING_REASON_ZH = {
+    "REVIEW_REDUCTION": (
+        "趋势受损得到第二个独立维度的确认;考虑降低市场暴露,并并列比较保护方案"
+    ),
+    "REVIEW_HEDGE": (
+        "短期压力升高而长期趋势未明显受损;比较有限期保护与继续观察"
+    ),
+    "CONFLICTED": "修复信号与仍然存在的损伤互相冲突;两份证据都要读",
+    "WATCH": "单一维度值得注意;尚不足以改变暴露",
+    "NO_NEW_DEFENSE_CASE": "没有值得注意的恶化;这不是对安全的预测,未覆盖风险仍然存在",
+}
+
+_PURPOSE_ZH = {
+    "day_end_analysis": "日终分析",
+    "intraday_observation": "盘中观察",
+    "instrument_quotes": "工具报价",
+    "training": "训练",
+}
+
+# Fixed phrases produced by upstream modules, mapped rather than re-derived so
+# the two languages are one document with two fixed renderings.
+_ZH_PHRASES = {
+    "none of the state labels currently fit": "当前没有任何状态标签适用",
+    "a settled session": "已结算交易日",
+    "a provisional intraday reading is not a settled session": "盘中临时读数不是已结算交易日",
+    "rule judgement, gain unvalidated": "规则判断,增益未验证",
+    "replayed, gain measured": "已回放,增益已测量",
+    "validated against a strong benchmark, out of sample": "已对强基准做样本外验证",
+    "pending replay; the delay and false-alarm costs are unmeasured": "待回放;延迟与误报代价未测量",
+    "If you would rather hold less, compare the de-risk control. If you would "
+    "rather keep the exposure and pay to insure it, compare the puts. Market "
+    "data cannot choose between those two preferences.": (
+        "若你宁愿少持有,对照减仓方案;若你宁愿保留暴露并付费投保,对照 put 候选。"
+        "市场数据无法在两种偏好之间替你选择。"
+    ),
+    "no candidate cleared the screen; the controls are the whole comparison": (
+        "没有候选通过筛选;对照项就是全部比较内容"
+    ),
+    "payoff is at expiry only; the reference exposure is a stated yardstick and "
+    "not anyone's position": "损益仅按到期结算;参考暴露是明确声明的标尺,不是任何人的持仓",
+    "each underlying is priced against its own reference exposure, so rows for "
+    "different symbols are not alternatives to each other; comparing them as "
+    "hedges for one portfolio would need a fixed common reference and a stated "
+    "mapping, which this does not have": (
+        "每个标的都按其各自的参考暴露计价,因此不同标的的行彼此不是替代方案;"
+        "要把它们当作同一组合的对冲来比较,需要一个固定的共同参考和明确的映射假设,"
+        "而本报告没有这些"
+    ),
+    "a missing dimension is unknown, not calm": "缺失的维度是未知,不是平静",
+    "every dimension reported": "所有维度均有报告",
+    "a label appearing is not yet an event; it becomes one only after it holds": (
+        "标签出现还不是事件;只有持续成立后才成为事件"
+    ),
+    "Reducing exposure and buying protection answer different preferences: "
+    "how much upside you are willing to give up, and how much you will pay "
+    "to keep it. Market data cannot choose between them.": (
+        "减仓与买保护回答的是两种不同偏好:你愿意放弃多少上涨,又愿意付出多少来保留它。"
+        "市场数据无法在两者之间替你选择。"
+    ),
+    "Nothing here reads a position, so none of it is advice about holdings.": (
+        "本报告不读取任何持仓,因此其中没有任何内容是关于持仓的建议。"
+    ),
+    "no independent second source in this run; re-run with --with-ibkr, or use "
+    "scripts/reconcile_spy.py, to compare against TWS": (
+        "本次运行没有独立第二数据源;加 --with-ibkr 重跑,或用 scripts/reconcile_spy.py "
+        "与 TWS 对照"
+    ),
+}
+
+_EVENT_KIND_ZH = {"opened": "开启", "released": "解除", "exceptional_review": "例外复查"}
+
+
+def _zh(text: str) -> str:
+    """A fixed phrase, or a patterned one, or the text unchanged.
+
+    Upstream modules produce English prose for triggers, contrary evidence and
+    the like. Their templates are stable, so the Chinese rendering translates
+    the template rather than duplicating the logic that produced it.
+    """
+    if text in _ZH_PHRASES:
+        return _ZH_PHRASES[text]
+    import re
+
+    match = re.match(
+        r"^(.+) sits at the (\d+)% rank of its own history; "
+        r"a move past (\d+)% or (\d+)% would make this description stale$",
+        text,
+    )
+    if match:
+        name, rank, above, below = match.groups()
+        return f"{name} 处于自身历史的 {rank}% 分位;越过 {above}% 或 {below}% 会令这份描述过时"
+    match = re.match(r"^(.+) improved over 20 sessions$", text)
+    if match:
+        return f"{match.group(1)} 在 20 个交易日改善"
+    match = re.match(
+        r"^(.+) risk rank (\d+)% \((.+), (\d+)% of history more favourable\)$",
+        text,
+    )
+    if match:
+        name, rank, value_unit, favourable = match.groups()
+        value, _, unit = value_unit.partition(" ")
+        return (
+            f"{name} 风险分位 {rank}%({value} {_UNIT_ZH.get(unit, unit)},"
+            f"{favourable}% 的历史更有利)"
+        )
+    return text
+
+
+def _indicator_table(indicators: list[dict[str, Any]], language: str = "en") -> str:
+    if language == "zh":
+        header = "| 维度 | 指标 | 数值 | 单位 | 20日变化 | 分位 | 方向 |"
+        rule = "|---|---|---|---|---|---|---|"
+        rows = [
+            "| {dimension} | {name} | {value} | {unit} | {change} | {rank} | {direction} |".format(
+                dimension=_DIMENSION_ZH.get(i["dimension"], i["dimension"]),
+                name=i["name"],
+                value="—" if i["value"] is None else f"{i['value']:.2f}",
+                unit=_UNIT_ZH.get(i["unit"], i["unit"]),
+                change="—" if i["change_20"] is None else f"{i['change_20']:+.2f}",
+                rank="—" if i["percentile"] is None else f"{i['percentile']:.0%}",
+                direction=_DIRECTION_ZH.get(i["direction"], i["direction"]),
+            )
+            for i in indicators
+        ]
+        return "\n".join([header, rule, *rows])
+    header = "| dimension | indicator | value | unit | 20-session change | rank | direction |"
+    rule = "|---|---|---|---|---|---|---|"
+    rows = [
+        "| {dimension} | {name} | {value} | {unit} | {change} | {rank} | {direction} |".format(
+            dimension=i["dimension"],
+            name=i["name"],
+            value="—" if i["value"] is None else f"{i['value']:.2f}",
+            unit=i["unit"],
+            change="—" if i["change_20"] is None else f"{i['change_20']:+.2f}",
+            rank="—" if i["percentile"] is None else f"{i['percentile']:.0%}",
+            direction=i["direction"],
+        )
+        for i in indicators
+    ]
+    return "\n".join([header, rule, *rows])
+
+
+def _reference_exposure_lines(reference: dict[str, Any], language: str = "en") -> list[str]:
+    """The reference exposure from the only measured mechanism, both languages.
+
+    Volatility targeting is the one rule with a recorded 26-year ledger behind
+    it, so it is the one number the report may attach to a position-size
+    suggestion - and even that is presented as a yardstick, not advice.
+    """
+    if not reference:
+        return []
+    trailing = reference.get("trailing_exposure")
+    ewma = reference.get("ewma_exposure")
+    trend = reference.get("trend_exposure")
+    target = reference.get("target_volatility_annual")
+    if trailing is None:
+        return []
+    def pct(value: Any) -> str:
+        return "—" if value is None else f"{float(value):.0%}"
+    if language == "zh":
+        return [
+            f"- 参考暴露(波动率目标化 {target:.0%},唯一有实测记录的机制):"
+            f"trailing 版 {pct(trailing)},EWMA 版 {pct(ewma)},趋势规则 {pct(trend)}",
+            "- 26 年账本:年化 6.4%、最大回撤 −34.4%(最差情景是 2000-2002 慢熊,"
+            "而非 2008);这是标尺,不是建议",
+        ]
+    return [
+        f"- reference exposure (volatility targeting at {target:.0%}, the only "
+        f"mechanism with a measured record): trailing {pct(trailing)}, EWMA "
+        f"{pct(ewma)}, trend rule {pct(trend)}",
+        "- measured 26-year ledger: 6.4% annual return, -34.4% maximum drawdown; "
+        "the worst case was the 2000-2002 slow bear, not 2008. A yardstick, not advice",
+    ]
+
+
+def _condition_lines(conditionals: dict[str, Any], language: str = "en") -> list[str]:
+    """The operational block: what history says about states like today's.
+
+    Frequencies over settled history, computed causally and labelled as
+    frequencies. This is the answer the report exists to give - a percentile
+    alone cannot say what a given state was followed by.
+    """
+    if not conditionals or "current" not in conditionals:
+        return []
+
+    def pct(value: Any) -> str:
+        return "—" if value is None else f"{float(value):.0%}"
+
+    base = conditionals.get("base_rate", {})
+    above = conditionals.get("above_200d_ma", {})
+    below = conditionals.get("below_200d_ma", {})
+    tail = conditionals.get("vol_at_least_current", {})
+    current = conditionals.get("current", {})
+    event_name = "5% 跌幅" if language == "zh" else "a 5% drawdown within 20 sessions"
+
+    if language == "zh":
+        lines = [
+            f"- 历史基准:20 个交易日内出现 {event_name}的频率,历史上有 "
+            f"{pct(base.get('event_frequency'))} 个交易日之后发生,"
+            f"2013 年以来为 {pct(base.get('event_frequency_post_2013'))}",
+            f"- 价格在 200 日均线**上方**:该频率为 {pct(above.get('event_frequency'))}"
+            f"(2013 年以来 {pct(above.get('event_frequency_post_2013'))});"
+            f"**下方**:{pct(below.get('event_frequency'))}"
+            f"(2013 年以来 {pct(below.get('event_frequency_post_2013'))})",
+            f"- 20 日已实现波动不低于当前水平(当前处于历史 "
+            f"{pct(current.get('vol_rank'))} 分位)的日子:该频率为 "
+            f"{pct(tail.get('event_frequency'))}"
+            f"(2013 年以来 {pct(tail.get('event_frequency_post_2013'))})",
+            "- 以上是已结算历史的条件频率,不是对未来概率的预测",
+        ]
+        return lines
+    return [
+        f"- historical base rate: a 5% drawdown within 20 sessions followed "
+        f"{pct(base.get('event_frequency'))} of sessions "
+        f"({pct(base.get('event_frequency_post_2013'))} since 2013)",
+        f"- with price **above** its 200-session average that frequency was "
+        f"{pct(above.get('event_frequency'))} "
+        f"({pct(above.get('event_frequency_post_2013'))} since 2013); "
+        f"**below** it, {pct(below.get('event_frequency'))} "
+        f"({pct(below.get('event_frequency_post_2013'))} since 2013)",
+        f"- on days when 20-session realised volatility ranked at least as high "
+        f"as now (the {pct(current.get('vol_rank'))} rank), the frequency was "
+        f"{pct(tail.get('event_frequency'))} "
+        f"({pct(tail.get('event_frequency_post_2013'))} since 2013)",
+        "- frequencies over settled history, not predicted probabilities",
+    ]
+
+
+def _method_lines(
+    judgment: dict[str, Any],
+    review: dict[str, Any],
+    language: str = "en",
+) -> list[str]:
+    """The compressed honesty block: grade, reason and registry in one place.
+
+    Everything a sceptical reader needs to discount the report, kept out of the
+    operational sections and put where it cannot be missed either.
+    """
+    grade = judgment.get("research_grade", "")
+    reason = judgment.get("leaning_reason", "")
+    if language == "zh":
+        if judgment.get("action_leaning") == DATA_INSUFFICIENT:
+            reason = _PRE_REGISTERED_REASON_ZH
+        else:
+            reason = _LEANING_REASON_ZH.get(judgment.get("action_leaning"), reason)
+        lines = [
+            f"- 研究等级:{_zh(grade)}",
+            f"- 为什么行动倾向是{_leaning_zh(judgment.get('action_leaning', ''))}:{reason}",
+        ]
+        lines += _registry_lines(review.get("research_registry", {}), "zh")
+        return lines
+    lines = [
+        f"- research grade: {grade}",
+        f"- why the leaning is {judgment.get('action_leaning', '')}: {reason}",
+    ]
+    lines += _registry_lines(review.get("research_registry", {}), "en")
+    return lines
+
+
+def _registry_lines(summary: dict[str, Any], language: str = "en") -> list[str]:
+    if not summary:
+        return []
+    may_influence = [
+        name
+        for capability in summary.get("by_capability", {}).values()
+        for name in capability.get("may_influence", [])
+    ]
+    if language == "zh":
+        lines = [f"- 研究登记:共 {summary.get('registered', 0)} 个实验"]
+        lines.append(
+            f"- 被允许影响建议的实验:{'、'.join(may_influence) if may_influence else '无'}"
+        )
+        return lines
+    return [
+        f"- research registry: {summary.get('registered', 0)} experiments registered",
+        f"- experiments allowed to influence a recommendation: "
+        f"{', '.join(may_influence) if may_influence else 'none'}",
+    ]
+
+
+def render_markdown(report: dict[str, Any], language: str = "en") -> str:
+    """A templated rendering. No sentence here is generated from the numbers.
+
+    `language` selects the fixed template set; the report structure is the same
+    document in both, so the two cannot drift into two answers.
+    """
+    if language not in {"en", "zh"}:
+        raise ValueError(f"unknown report language {language!r}")
     status = report["1_data_status"]
     judgment = report["2_judgment"]
     changes = report["3_changes"]
@@ -263,7 +609,100 @@ def render_markdown(report: dict[str, Any]) -> str:
     instruments = report["5_instruments"]
     scenarios = report["6_scenarios"]
     review = report["7_review"]
+    zh = language == "zh"
 
+    if zh:
+        state_text = "、".join(_state_zh(s) for s in judgment["state_labels"])
+        leaning_text = _leaning_zh(judgment["action_leaning"])
+        lines = [
+            f"# 市场状态,交易日 {status['session_date']}",
+            "",
+            "## 1. 数据状态",
+            f"- 快照:`{status['snapshot_id']}`",
+            f"- 证据截至:{status['evidence_as_of']}",
+            f"- 已批准用途:{'、'.join(_PURPOSE_ZH.get(u, u) for u in status['approved_uses']) or '未授予任何用途'}",
+            f"- {_zh(status['note'])}",
+        ]
+        if status.get("cross_source"):
+            cross = status["cross_source"]
+            if cross.get("compared_days"):
+                lines.append(
+                    f"- 跨源核验:{cross.get('compared_days')} 个交易日对照 "
+                    f"{'、'.join(cross.get('sources', []))},"
+                    f"{cross.get('days_outside_tolerance')} 天超容差"
+                )
+            else:
+                lines.append(f"- 跨源核验:{_zh(cross.get('note', '未运行'))}")
+        leaning_short = (
+            "没有规则赢得过输出行动倾向的资格;请用下面的历史频率和参考暴露自己判断"
+            if judgment["action_leaning"] == DATA_INSUFFICIENT
+            else _LEANING_REASON_ZH.get(judgment["action_leaning"], "")
+        )
+        lines += [
+            "",
+            "## 2. 对操作的含义",
+            f"- 状态:{state_text}",
+            f"- 行动倾向:**{leaning_text}**——{leaning_short}",
+            "",
+            * _condition_lines(judgment.get("conditionals", {}), "zh"),
+            "",
+            * _reference_exposure_lines(judgment.get("reference_exposure", {}), "zh"),
+            "",
+            "**支持当前状态值得注意的证据**" if judgment["supporting"] else "**支持** — 无",
+        ]
+        lines += [f"- {_zh(item)}" for item in judgment["supporting"]]
+        if judgment["supporting_withheld"]:
+            lines.append(f"-(另有 {judgment['supporting_withheld']} 项未显示)")
+        lines += ["", "**相反的证据**" if judgment["contrary"] else "**相反的证据** — 无"]
+        lines += [f"- {_zh(item)}" for item in judgment["contrary"]]
+        if judgment["contrary_withheld"]:
+            lines.append(f"-(另有 {judgment['contrary_withheld']} 项未显示)")
+
+        lines += ["", "## 3. 与上次相比"]
+        lines += [f"- 新增标签:{_state_zh(label)}" for label in changes["labels_added"]]
+        lines += [f"- 消失标签:{_state_zh(label)}" for label in changes["labels_dropped"]]
+        lines += [
+            f"- {_EVENT_KIND_ZH.get(e['kind'], e['kind'])}:{e['detail']}" for e in changes["new_events"]
+        ]
+        if not (changes["labels_added"] or changes["labels_dropped"] or changes["new_events"]):
+            lines.append("- 无变化")
+        if changes["note"]:
+            lines.append(f"- {_zh(changes['note'])}")
+
+        lines += ["", "## 4. 五个维度", "", _indicator_table(dimensions["indicators"], "zh")]
+        if dimensions["missing_dimensions"]:
+            missing = "、".join(_DIMENSION_ZH.get(d, d) for d in dimensions["missing_dimensions"])
+            lines.append(f"\n缺失:{missing} — {_zh(dimensions['missing_note'])}。")
+        for clash in dimensions["contradictions"]:
+            if clash.get("kind") == "dimensions_disagree":
+                left = _DIMENSION_ZH.get(clash.get("deteriorating"), clash.get("deteriorating"))
+                right = _DIMENSION_ZH.get(clash.get("improving"), clash.get("improving"))
+                lines.append(f"- 维度矛盾:{left}在 20 个交易日恶化,而{right}改善;两份读数都不被消减")
+            else:
+                dimension = _DIMENSION_ZH.get(clash.get("dimension"), clash.get("dimension"))
+                lines.append(f"- 维度内部分歧:{dimension}的指标方向相反,该维度没有单一读数")
+
+        lines += ["", "## 5. 减仓还是买保护", "", _zh(instruments["conditional"])]
+        if instruments["normal_outcome"]:
+            lines.append(f"\n{_zh(instruments['normal_outcome'])}")
+
+        lines += ["", "## 6. 参考暴露下的情景损益", ""]
+        lines.append(
+            f"参考:每个标的 ${scenarios['reference_notional_usd']:,.0f}。{_zh(scenarios['note'])}"
+        )
+        if len(scenarios.get("underlyings", [])) > 1:
+            lines.append("")
+            lines.append(_zh(scenarios["cross_symbol_warning"]))
+        lines.append("")
+        lines.append(_scenario_table(scenarios["rows"]))
+
+        lines += ["", "## 7. 什么会改变这份读数,以及方法声明"]
+        lines += [f"- {_zh(t['detail'])}" for t in review["triggers"]]
+        lines += [f"- {_zh(c)}" for c in review["applicable_conditions"]]
+        lines += _method_lines(judgment, review, "zh")
+        return "\n".join(lines)
+
+    state_text = ", ".join(judgment["state_labels"])
     lines = [
         f"# Market state, session {status['session_date']}",
         "",
@@ -285,20 +724,28 @@ def render_markdown(report: dict[str, Any]) -> str:
             # An absent check has to appear, or a reader assumes it passed.
             lines.append(f"- cross-source: {cross.get('note', 'not run')}")
 
+    leaning_short = (
+        "no rule has earned the right to lean; use the frequencies and the "
+        "reference exposure below"
+        if judgment["action_leaning"] == DATA_INSUFFICIENT
+        else judgment["leaning_reason"]
+    )
     lines += [
         "",
-        "## 2. Market reading",
-        f"- state: {', '.join(judgment['state_labels'])}",
-        f"- action leaning: **{judgment['action_leaning']}**",
-        f"- research grade: {judgment['research_grade']}",
-        f"- {judgment['leaning_reason']}",
+        "## 2. What this means for a position",
+        f"- state: {state_text}",
+        f"- action leaning: **{judgment['action_leaning']}** - {leaning_short}",
         "",
-        "**Supporting**" if judgment["supporting"] else "**Supporting** — none",
+        * _condition_lines(judgment.get("conditionals", {}), "en"),
+        "",
+        * _reference_exposure_lines(judgment.get("reference_exposure", {}), "en"),
+        "",
+        "**Evidence for attention**" if judgment["supporting"] else "**Supporting** — none",
     ]
     lines += [f"- {item}" for item in judgment["supporting"]]
     if judgment["supporting_withheld"]:
         lines.append(f"- ({judgment['supporting_withheld']} further items not shown)")
-    lines += ["", "**Against**" if judgment["contrary"] else "**Against** — none"]
+    lines += ["", "**Evidence against**" if judgment["contrary"] else "**Against** — none"]
     lines += [f"- {item}" for item in judgment["contrary"]]
     if judgment["contrary_withheld"]:
         lines.append(f"- ({judgment['contrary_withheld']} further items not shown)")
@@ -312,7 +759,7 @@ def render_markdown(report: dict[str, Any]) -> str:
     if changes["note"]:
         lines.append(f"- {changes['note']}")
 
-    lines += ["", "## 4. Dimensions", "", _indicator_table(dimensions["indicators"])]
+    lines += ["", "## 4. Dimensions", "", _indicator_table(dimensions["indicators"], "en")]
     if dimensions["missing_dimensions"]:
         lines.append(
             f"\nMissing: {', '.join(dimensions['missing_dimensions'])} — "
@@ -336,29 +783,11 @@ def render_markdown(report: dict[str, Any]) -> str:
     lines.append("")
     lines.append(_scenario_table(scenarios["rows"]))
 
-    lines += ["", "## 7. What would change this"]
+    lines += ["", "## 7. What would change this, and the method behind it"]
     lines += [f"- {t['detail']}" for t in review["triggers"]]
     lines += [f"- {c}" for c in review["applicable_conditions"]]
-    lines.append(f"- research grade: {review['research_grade']}")
+    lines += _method_lines(judgment, review, "en")
     return "\n".join(lines)
-
-
-def _indicator_table(indicators: list[dict[str, Any]]) -> str:
-    header = "| dimension | indicator | value | unit | 20-session change | rank | direction |"
-    rule = "|---|---|---|---|---|---|---|"
-    rows = [
-        "| {dimension} | {name} | {value} | {unit} | {change} | {rank} | {direction} |".format(
-            dimension=i["dimension"],
-            name=i["name"],
-            value="—" if i["value"] is None else f"{i['value']:.2f}",
-            unit=i["unit"],
-            change="—" if i["change_20"] is None else f"{i['change_20']:+.2f}",
-            rank="—" if i["percentile"] is None else f"{i['percentile']:.0%}",
-            direction=i["direction"],
-        )
-        for i in indicators
-    ]
-    return "\n".join([header, rule, *rows])
 
 
 def _scenario_table(rows: list[dict[str, Any]]) -> str:
@@ -401,14 +830,61 @@ __all__ = [
 ]
 
 
-def render_html(report: dict[str, Any], title: str = "Market state") -> str:
+def _rank_strip(report: dict[str, Any], language: str = "en") -> str:
+    """One bar per indicator, ordered by how risky its level is.
+
+    Twelve rows of numbers do not answer "is anything unusual today" - the eye
+    has to read and compare every one. A sorted bar answers it in a glance, and
+    it is the same `risk_rank` the table already carries, oriented so that
+    longer always means riskier rather than larger.
+
+    No chart library. The page has to open from disk on a machine with no
+    network, and a dependency that renders nothing offline is worse than a bar
+    made of a div.
+    """
+    indicators = [
+        i for i in report["4_dimensions"]["indicators"]
+        if i.get("risk_rank") is not None and not i.get("overlaps")
+    ]
+    if not indicators:
+        return ""
+    indicators.sort(key=lambda i: i["risk_rank"], reverse=True)
+    heading = "风险分位（越长越危险）" if language == "zh" else "Risk rank (longer is riskier)"
+    calm = "历史上更平静的位置" if language == "zh" else "calmer than history"
+
+    rows = []
+    for item in indicators:
+        rank = float(item["risk_rank"])
+        # Colour carries the same number, not a second opinion about it.
+        tone = "#c0392b" if rank >= 0.8 else "#e67e22" if rank >= 0.6 else "#7f8c8d"
+        rows.append(
+            f"<tr><td class='n'>{_esc(item['dimension'])}</td>"
+            f"<td class='n'>{_esc(item['name'])}</td>"
+            f"<td class='bar'><span style='width:{rank * 100:.0f}%;background:{tone}'></span></td>"
+            f"<td class='v'>{rank:.0%}</td>"
+            f"<td class='v'>{'' if item['value'] is None else format(item['value'], '.2f')}</td>"
+            f"<td class='d'>{_esc(item['direction'])}</td></tr>"
+        )
+    return (
+        f"<h2>{_esc(heading)}</h2>"
+        f"<p class='hint'>{_esc(calm)} &larr; &rarr; "
+        f"{_esc('历史上更危险的位置' if language == 'zh' else 'riskier than history')}</p>"
+        "<table class='strip'><tbody>" + "".join(rows) + "</tbody></table>"
+    )
+
+
+def render_html(
+    report: dict[str, Any],
+    title: str = "Market state",
+    language: str = "en",
+) -> str:
     """The same seven sections as a page. Rendered from the report, not the Markdown.
 
     A small hand-written renderer rather than a Markdown dependency: the subset
     emitted here is headings, lists and two tables, and converting the prose a
     second time would give two documents that could drift apart.
     """
-    markdown = render_markdown(report)
+    markdown = render_markdown(report, language)
     body: list[str] = []
     rows: list[str] = []
 
@@ -425,13 +901,17 @@ def render_html(report: dict[str, Any], title: str = "Market state") -> str:
         body.append("</tbody></table>")
         rows.clear()
 
+    strip = _rank_strip(report, language)
     for line in markdown.splitlines():
         if line.startswith("|"):
             rows.append(line)
             continue
         flush_table()
         if line.startswith("# "):
+            # Above the prose, because the question a reader arrives with is
+            # "is anything unusual today" and every paragraph delays the answer.
             body.append(f"<h1>{_esc(line[2:])}</h1>")
+            body.append(strip)
         elif line.startswith("## "):
             body.append(f"<h2>{_esc(line[3:])}</h2>")
         elif line.startswith("- "):
@@ -447,7 +927,14 @@ def render_html(report: dict[str, Any], title: str = "Market state") -> str:
         "padding:0 1rem}table{border-collapse:collapse;width:100%;margin:1rem 0}"
         "th,td{border:1px solid #ddd;padding:.35rem .5rem;text-align:left}"
         "th{background:#f6f6f6}h2{margin-top:2rem;border-bottom:1px solid #eee}"
-        "li{margin:.2rem 0}</style>"
+        "li{margin:.2rem 0}"
+        "table.strip td{border:0;padding:.2rem .5rem;white-space:nowrap}"
+        "table.strip tr:nth-child(odd){background:#fafafa}"
+        "td.bar{width:55%;border:0}"
+        "td.bar span{display:block;height:.85rem;border-radius:2px;min-width:2px}"
+        "td.v{text-align:right;font-variant-numeric:tabular-nums}"
+        "td.n{color:#333}td.d{color:#777;font-size:.85em}"
+        "p.hint{color:#888;font-size:.85em;margin:.2rem 0 .6rem}</style>"
         + "".join(body)
     )
 
