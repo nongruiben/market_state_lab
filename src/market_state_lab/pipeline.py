@@ -16,6 +16,7 @@ was findable, so it outlived the thing it measured.
 from __future__ import annotations
 
 import json
+import os
 from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
@@ -27,7 +28,12 @@ from market_state_lab.config import ensure_runtime_directories, project_path
 from market_state_lab.data.fixtures import load_offline_fixture
 from market_state_lab.data.health import evaluate_manifest, required_health_failures
 from market_state_lab.data.public import PublicDataBundle, PublicDataLoader
-from market_state_lab.data.reconciliation import unverifiable
+from market_state_lab.data.reconciliation import (
+    SourceSeries,
+    reconcile_closes,
+    unverifiable,
+)
+from market_state_lab.data.reconciliation import summarise as reconciliation_summary
 from market_state_lab.data.snapshots import latest_sessions, read_snapshot
 from market_state_lab.data.validation import issues_frame, validate_daily_bars
 from market_state_lab.data.validation import summarise as quality_summary
@@ -125,6 +131,66 @@ def _protection(root: Path) -> dict[str, Any]:
     }
 
 
+def _cross_source(
+    config: dict[str, Any],
+    bundle: PublicDataBundle,
+    spy: pd.Series,
+    with_ibkr: bool,
+) -> dict[str, Any]:
+    """Verify the core input against a genuinely separate feed, if there is one.
+
+    TWS is the only independent second source this project has. One vendor's
+    adjusted series against its own raw series is one source in two conventions,
+    not corroboration, and making that comparison pass would take declaring the
+    raw series adjusted - the false declaration that already cost this project a
+    cross-source check once.
+
+    Only the unadjusted public series may be compared, because TWS trade bars
+    are unadjusted and a year of SPY dividends is 1.1% of drift - wide enough
+    that a measured tolerance absorbs it and reports agreement.
+    """
+    raw = getattr(bundle, "etf_close_unadjusted", pd.DataFrame())
+    unavailable = {
+        "symbol": "SPY",
+        "sources": ["public data only"],
+        "compared_days": 0,
+        "agreed": None,
+        "note": unverifiable(
+            "SPY daily closes",
+            "no independent second source in this run; re-run with --with-ibkr, or use "
+            "scripts/reconcile_spy.py, to compare against TWS",
+        ).detail,
+    }
+    if not with_ibkr or spy.empty or "spy" not in getattr(raw, "columns", []):
+        return unavailable
+
+    from market_state_lab.data.ibkr import ReadOnlyIBKRClient
+
+    os.environ.setdefault("IBKR_ALLOW_HISTORICAL", "1")
+    try:
+        with ReadOnlyIBKRClient(config) as client:
+            bars = client.historical_daily_bars(
+                client.qualify_stock("SPY"), duration="1 Y", what_to_show="TRADES"
+            )
+    except Exception as exc:
+        # A feed that could not be reached is not a feed that disagreed.
+        return {**unavailable, "note": f"TWS unavailable, so unverified: {exc}"}
+    if bars.empty:
+        return {**unavailable, "note": "TWS returned no bars, so unverified"}
+
+    tws = bars["close"]
+    tws.index = pd.to_datetime(tws.index).tz_localize(None).normalize()
+    public = raw["spy"].dropna()
+    public.index = pd.to_datetime(public.index).normalize()
+    return reconciliation_summary(
+        reconcile_closes(
+            "SPY",
+            SourceSeries("TWS", tws, adjusted=False),
+            SourceSeries("public raw", public, adjusted=False),
+        )
+    )
+
+
 def run_pipeline(
     config: dict[str, Any],
     with_ibkr: bool = False,
@@ -174,23 +240,7 @@ def run_pipeline(
 
     spy = bundle.etf_close["spy"].dropna() if "spy" in bundle.etf_close else pd.Series(dtype=float)
     issues = validate_daily_bars(pd.DataFrame({"close": spy}), "SPY") if not spy.empty else []
-    # No second source on this path, and saying so is the only honest option.
-    # One vendor's adjusted series against its own raw series is one source in
-    # two conventions, not corroboration - and making it pass would take
-    # declaring the raw series adjusted, which is the false declaration that
-    # already cost this project a cross-source check once. Real verification
-    # lives in scripts/reconcile_spy.py, where TWS is a genuinely separate feed.
-    reconciliation = {
-        "symbol": "SPY",
-        "sources": ["public data only"],
-        "compared_days": 0,
-        "agreed": None,
-        "note": unverifiable(
-            "SPY daily closes",
-            "this run used one vendor; run scripts/reconcile_spy.py with TWS up for "
-            "an independent second source",
-        ).detail,
-    }
+    reconciliation = _cross_source(config, bundle, spy, with_ibkr)
     benchmarks = compare_against_benchmarks(spy) if len(spy) > 300 else pd.DataFrame()
 
     events_path = root / "data" / ("events_offline.json" if offline else "events.json")

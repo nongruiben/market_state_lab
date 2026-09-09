@@ -24,10 +24,17 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--notional", type=float, default=100_000.0)
     parser.add_argument("--offline", action="store_true", help="run the synthetic fixture")
+    parser.add_argument(
+        "--with-ibkr", action="store_true",
+        help="use TWS as an independent second source for the cross-source check",
+    )
     parser.add_argument("--show", action="store_true", help="print the report to stdout")
     args = parser.parse_args()
 
-    written = run_pipeline(load_config(), offline=args.offline, notional=args.notional)
+    written = run_pipeline(
+        load_config(), with_ibkr=args.with_ibkr,
+        offline=args.offline, notional=args.notional,
+    )
     if args.show:
         print(written["report.md"].read_text(encoding="utf-8"))
     print(f"wrote {len(written)} artefacts to {next(iter(written.values())).parent}")

@@ -16,14 +16,33 @@ def test_ibkr_configuration_is_opt_in_and_read_only() -> None:
     assert "auto_connect" not in config["ibkr"]
 
 
-def test_pipeline_never_connects_to_ibkr_without_the_flag() -> None:
-    """The only path to a connection is the --with-ibkr flag, and the snapshot it
-    fetches lands after the report is already built, so it cannot reach an output."""
-    source = (Path(PROJECT_ROOT) / "src" / "market_state_lab" / "pipeline.py").read_text(
+def _pipeline_source() -> str:
+    return (Path(PROJECT_ROOT) / "src" / "market_state_lab" / "pipeline.py").read_text(
         encoding="utf-8"
     )
-    assert source.count("ReadOnlyIBKRClient(") == 1
-    assert "if with_ibkr:" in source
+
+
+def test_pipeline_never_connects_to_ibkr_without_the_flag() -> None:
+    """Every connection is behind --with-ibkr, and there are only two of them."""
+    source = _pipeline_source()
+    assert source.count("ReadOnlyIBKRClient(") == 2  # cross-source check, and the snapshot
+    assert source.count("if not with_ibkr") == 1  # the cross-source guard
+    assert source.count("if with_ibkr:") == 1  # the snapshot guard
+
+
+def test_tws_may_verify_the_data_but_never_feed_the_market_reading() -> None:
+    """The reading is formed from public data before TWS is asked anything.
+
+    TWS is allowed to corroborate what the description was built from - that is
+    the whole point of a second source - and it is not allowed to be one of the
+    inputs it corroborates. The order enforces it: evidence and assessment are
+    settled before the first connection, so a TWS answer can reach the data
+    status line and nothing above it.
+    """
+    source = _pipeline_source()
+    assert source.index("assessment = assess(") < source.index("_cross_source(config")
+    assert source.index("_cross_source(config") < source.index("report = build_report(")
+    # And the snapshot still lands after the report, where it can reach nothing.
     assert source.index("report = build_report(") < source.index("if with_ibkr:")
 
 

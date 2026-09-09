@@ -60,6 +60,10 @@
 
 `cli run` 走同一个 `run_pipeline`——一次运行一套产物，两条实现迟早会给出两个答案。
 
+TWS 开着时加 `--with-ibkr`，日报第 1 段的跨源核验会用 TWS 作为**真正独立的第二个数据源**（实测 250 个交易日、最大相对差 4.6e-08、0 天超容差）。不加就如实写"无独立第二源"。
+
+**描述层本身不需要 TWS，而且用 Yahoo 更好**：价格是同一个数，但 Yahoo 有 6,710 个交易日的历史（因果分位需要长历史）和 TWS 没有的信用利差。TWS 不可替代的只有期权链。
+
 产出 §18 的十件产物到 `reports/{run_id}/`：`run_manifest.json`、`data_quality_summary.json`、`data_quality_issues.csv`、`source_reconciliation.csv`、`market_evidence.parquet`、`market_assessment.json`、`instrument_candidates.csv`、`scenario_comparison.csv`、`report.md`、`report.html`。
 
 防御工具表（需要 TWS，收盘后即可，**不必盘中**）：
