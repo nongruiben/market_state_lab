@@ -1,16 +1,15 @@
 """The fault-injection matrix, plan section 16.1, against the layers that exist.
 
-Twelve scenarios, ten of them covered here. Each injects a fault into recorded
+Twelve scenarios, eleven of them covered here. Each injects a fault into recorded
 data and pins the behaviour the plan demands. The two whose guarding layer is
 not built yet are listed at the bottom with the module that owns them - they
 are the remaining scope, and this file is the checklist that says so. A row
 listed as unbuilt must not be claimed as covered; that is exactly the
 over-claiming this phase exists to stop.
 
-Both remaining rows need a layer that does not exist rather than work that was
-skipped: replaying dependent features after a historical revision needs the
-feature layer, and a low-frequency alert state machine needs the assessment
-layer. This matrix is therefore as complete as it can be until P3 lands.
+The one remaining row needs a layer that does not exist rather than work that
+was skipped: replaying dependent features after a historical revision needs the
+feature layer to be rebuilt on the validated snapshot, which is P4 work.
 
 The injection target is what the previous layer now produces: raw payloads with
 a request record each, from which the pipeline is rebuilt. Live connections are
@@ -403,11 +402,36 @@ def test_an_action_not_yet_public_cannot_explain_the_day_it_lands_on() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Row 12: restarting the alert state machine re-sends nothing and drops nothing.
+# ---------------------------------------------------------------------------
+
+
+def test_the_alert_machine_survives_a_restart_without_repeating_itself(tmp_path) -> None:
+    from market_state_lab.events import EventLog, EventRules
+
+    rules = EventRules(confirm_sessions=3, release_sessions=5, cooldown_sessions=0)
+    log = EventLog(rules=rules)
+    said = []
+    for session in ("2026-09-01", "2026-09-02", "2026-09-03"):
+        said += log.observe(["trend_damaged"], session)
+    assert len(said) == 1
+    log.save(tmp_path / "events.json")
+
+    restarted = EventLog.load(tmp_path / "events.json", rules)
+    # Nothing repeated...
+    assert restarted.observe(["trend_damaged"], "2026-09-04") == []
+    # ...and nothing lost: the inherited event still knows how to close.
+    closing = [
+        n for session in ("2026-09-07", "2026-09-08", "2026-09-09", "2026-09-10", "2026-09-11")
+        for n in restarted.observe([], session)
+    ]
+    assert [n.kind for n in closing] == ["released"]
+
+
+# ---------------------------------------------------------------------------
 # Unbuilt rows. They stay listed until their layer lands:
 #
 # 11 historical pollution repair -> features/models: dependent features and
 #                                   state invalidated and replayed; original
 #                                   report kept.
-# 12 low-frequency alert state    -> market_assessment.py: restarting the state
-#    machine restart                 machine does not re-send or drop events.
 # ---------------------------------------------------------------------------

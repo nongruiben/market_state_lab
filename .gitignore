@@ -30,3 +30,8 @@ data/raw/alfred/
 
 # Local continuation scratch for the user's workflow harness, not project files
 msl_continue*.txt
+
+# Daily report state and event machine are per-machine records
+data/events.json
+reports/daily_report_*
+reports/reconciliation_*
