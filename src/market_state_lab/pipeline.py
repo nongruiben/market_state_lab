@@ -101,6 +101,10 @@ def _as_of(bundle: PublicDataBundle, session: Any) -> PublicDataBundle:
 # market is quiet.
 REQUIRED_DIMENSIONS = ("trend", "volatility")
 
+# Distinct from the probe (917) and the protection table (923), so two runs
+# never lock each other out of TWS.
+CROSS_SOURCE_CLIENT_ID = 931
+
 
 def require_dimensions(evidence, required: tuple[str, ...] = REQUIRED_DIMENSIONS) -> None:
     """Fail loudly when a required dimension has no value at all.
@@ -171,14 +175,20 @@ def _cross_source(
     from market_state_lab.data.ibkr import ReadOnlyIBKRClient
 
     os.environ.setdefault("IBKR_ALLOW_HISTORICAL", "1")
+    # Its own client id. Sharing one with the protection table means whichever
+    # runs second is refused, and "already in use" would be recorded as the
+    # feed disagreeing rather than as never having been asked.
+    config = {**config, "ibkr": {**config["ibkr"], "client_id": CROSS_SOURCE_CLIENT_ID}}
     try:
         with ReadOnlyIBKRClient(config) as client:
             bars = client.historical_daily_bars(
                 client.qualify_stock("SPY"), duration="1 Y", what_to_show="TRADES"
             )
     except Exception as exc:
-        # A feed that could not be reached is not a feed that disagreed.
-        return {**unavailable, "note": f"TWS unavailable, so unverified: {exc}"}
+        # A feed that could not be reached is not a feed that disagreed. Some of
+        # these carry no message at all, so the type has to be part of it.
+        detail = f"{type(exc).__name__}: {exc}".rstrip(": ")
+        return {**unavailable, "note": f"TWS unreachable, so unverified ({detail})"}
     if bars.empty:
         return {**unavailable, "note": "TWS returned no bars, so unverified"}
 

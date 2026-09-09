@@ -456,39 +456,6 @@ def _indicator_table(indicators: list[dict[str, Any]], language: str = "en") -> 
     return "\n".join([header, rule, *rows])
 
 
-def _reference_exposure_lines(reference: dict[str, Any], language: str = "en") -> list[str]:
-    """The reference exposure from the only measured mechanism, both languages.
-
-    Volatility targeting is the one rule with a recorded 26-year ledger behind
-    it, so it is the one number the report may attach to a position-size
-    suggestion - and even that is presented as a yardstick, not advice.
-    """
-    if not reference:
-        return []
-    trailing = reference.get("trailing_exposure")
-    ewma = reference.get("ewma_exposure")
-    trend = reference.get("trend_exposure")
-    target = reference.get("target_volatility_annual")
-    if trailing is None:
-        return []
-    def pct(value: Any) -> str:
-        return "—" if value is None else f"{float(value):.0%}"
-    if language == "zh":
-        return [
-            f"- 参考暴露(波动率目标化 {target:.0%},唯一有实测记录的机制):"
-            f"trailing 版 {pct(trailing)},EWMA 版 {pct(ewma)},趋势规则 {pct(trend)}",
-            "- 26 年账本:年化 6.4%、最大回撤 −34.4%(最差情景是 2000-2002 慢熊,"
-            "而非 2008);这是标尺,不是建议",
-        ]
-    return [
-        f"- reference exposure (volatility targeting at {target:.0%}, the only "
-        f"mechanism with a measured record): trailing {pct(trailing)}, EWMA "
-        f"{pct(ewma)}, trend rule {pct(trend)}",
-        "- measured 26-year ledger: 6.4% annual return, -34.4% maximum drawdown; "
-        "the worst case was the 2000-2002 slow bear, not 2008. A yardstick, not advice",
-    ]
-
-
 def _condition_lines(conditionals: dict[str, Any], language: str = "en") -> list[str]:
     """The operational block: what history says about states like today's.
 
@@ -617,6 +584,7 @@ def render_markdown(report: dict[str, Any], language: str = "en") -> str:
         lines = [
             f"# 市场状态,交易日 {status['session_date']}",
             "",
+            *_headline(inputs_of(report), "zh"),
             "## 1. 数据状态",
             f"- 快照:`{status['snapshot_id']}`",
             f"- 证据截至:{status['evidence_as_of']}",
@@ -646,7 +614,6 @@ def render_markdown(report: dict[str, Any], language: str = "en") -> str:
             "",
             * _condition_lines(judgment.get("conditionals", {}), "zh"),
             "",
-            * _reference_exposure_lines(judgment.get("reference_exposure", {}), "zh"),
             "",
             "**支持当前状态值得注意的证据**" if judgment["supporting"] else "**支持** — 无",
         ]
@@ -706,6 +673,7 @@ def render_markdown(report: dict[str, Any], language: str = "en") -> str:
     lines = [
         f"# Market state, session {status['session_date']}",
         "",
+        *_headline(inputs_of(report), "en"),
         "## 1. Data status",
         f"- snapshot: `{status['snapshot_id']}`",
         f"- evidence as of: {status['evidence_as_of']}",
@@ -738,7 +706,6 @@ def render_markdown(report: dict[str, Any], language: str = "en") -> str:
         "",
         * _condition_lines(judgment.get("conditionals", {}), "en"),
         "",
-        * _reference_exposure_lines(judgment.get("reference_exposure", {}), "en"),
         "",
         "**Evidence for attention**" if judgment["supporting"] else "**Supporting** — none",
     ]
@@ -830,6 +797,154 @@ __all__ = [
 ]
 
 
+def inputs_of(report: dict[str, Any]) -> dict[str, Any]:
+    """The judgment section already carries the exposure the headline needs."""
+    return report["2_judgment"]
+
+
+def _headline(judgment: dict[str, Any], language: str = "en") -> list[str]:
+    """The mechanical positions and the level each one turns at.
+
+    Everything else in the report is context for these lines. They were
+    previously a clause inside a paragraph in section 2, which is the wrong
+    place for the only output a reader can act on directly.
+
+    Neither is a forecast. Both are arithmetic on today's price and volatility
+    against a rule frozen in advance, which is exactly why they can be stated
+    plainly while the leaning below them cannot.
+
+    A trigger is added when it is known and the exposure is stated without one
+    when it is not: an exposure is useful on its own, and suppressing it for
+    want of the trigger would lose the more important half.
+    """
+    exposure = judgment.get("reference_exposure") or {}
+    zh = language == "zh"
+    body: list[str] = []
+
+    trend = exposure.get("trend_exposure")
+    if trend is not None:
+        line = f"- **趋势规则 {trend:.0%}**" if zh else f"- **Trend rule {trend:.0%}**"
+        spot, trigger = exposure.get("spot"), exposure.get("trend_trigger_price")
+        distance = exposure.get("trend_distance_pct")
+        if spot and trigger:
+            line += (
+                f" — SPY {spot:,.2f},200 日均线 {trigger:,.2f}"
+                + (f",高出 {distance:+.1%}" if distance is not None else "")
+                + ";跌破即转 0"
+                if zh
+                else f" — SPY at {spot:,.2f} against a 200-session average of {trigger:,.2f}"
+                + (f", {distance:+.1%} above it" if distance is not None else "")
+                + "; below it the rule goes to 0"
+            )
+        body.append(line)
+
+    trailing = exposure.get("trailing_exposure")
+    if trailing is not None:
+        line = (
+            f"- **波动率目标 {trailing:.0%}**" if zh
+            else f"- **Volatility target {trailing:.0%}**"
+        )
+        ewma = exposure.get("ewma_exposure")
+        if ewma is not None:
+            line += f"(EWMA 变体 {ewma:.0%})" if zh else f" (EWMA variant {ewma:.0%})"
+        now_vol = exposure.get("volatility_now_annual")
+        reduce_above = exposure.get("volatility_reduce_above") or exposure.get(
+            "target_volatility_annual"
+        )
+        if now_vol is not None and reduce_above:
+            line += (
+                f" — 20 日已实现波动率 {now_vol:.1%},目标 {reduce_above:.0%};"
+                "升破目标即按比例降仓"
+                if zh
+                else f" — 20-session realised volatility is {now_vol:.1%} against a "
+                f"{reduce_above:.0%} target; above the target the position scales "
+                "down one for one"
+            )
+        body.append(line)
+
+    if not body:
+        # A heading and a caveat with nothing between them is worse than silence.
+        return []
+    note = (
+        "两者都不是预测:它们是把今天的价格和波动率代入事先冻结的规则。"
+        "26 年实测账本 年化 6.4% / 最大回撤 −34.4%,是标尺不是建议。"
+        if zh
+        else "Neither is a forecast: both are today's price and volatility put through a "
+        "rule frozen in advance. The 26-year ledger behind them is 6.4% annual return "
+        "and a -34.4% maximum drawdown - a yardstick, not advice."
+    )
+    heading = "参考仓位" if zh else "Reference exposure"
+    return [f"## {heading}", "", *body, "", note, ""]
+
+
+def _frequency_chart(report: dict[str, Any], language: str = "en") -> str:
+    """The one comparison that changes a decision, drawn instead of listed.
+
+    Three numbers - the base rate, the rate above the long average, and the rate
+    below it - and the whole point is the gap between the last two. As prose
+    they read as three similar sentences; as bars the reader sees that the rule
+    at the top of the page separates an 11% regime from a 35% one.
+
+    The bar for the condition that holds today is marked, because "which of
+    these am I in" is the question a reader brings and the chart should not make
+    them work it out.
+
+    Frequencies over settled history. The caption says so, because a bar chart
+    of percentages is the easiest place in a report to read a probability that
+    was never claimed.
+    """
+    conditionals = report["2_judgment"].get("conditionals") or {}
+    if not conditionals.get("base_rate"):
+        return ""
+    zh = language == "zh"
+    below_now = bool((conditionals.get("current") or {}).get("below_200d_ma"))
+    entries = [
+        ("base_rate", "所有交易日" if zh else "all sessions", None),
+        ("above_200d_ma", "价格在 200 日均线之上" if zh else "price above its 200-session average",
+         not below_now),
+        ("below_200d_ma", "价格在 200 日均线之下" if zh else "price below its 200-session average",
+         below_now),
+        ("vol_at_least_current",
+         "波动率不低于当前" if zh else "volatility at least as high as now", None),
+    ]
+    # A window with too little history has no frequency, and drawing a bar for
+    # it would put a zero next to four real numbers.
+    rows = [
+        (label, conditionals[key], here)
+        for key, label, here in entries
+        if isinstance(conditionals.get(key), dict)
+        and conditionals[key].get("event_frequency") is not None
+    ]
+    if not rows:
+        return ""
+    widest = max(float(r[1]["event_frequency"]) for r in rows) or 1.0
+
+    bars = []
+    for label, block, here in rows:
+        share = float(block["event_frequency"])
+        tone = "#c0392b" if share >= 0.30 else "#e67e22" if share >= 0.20 else "#2d7d46"
+        # Outside _esc, or the entity is escaped into its own literal text.
+        mark = ("<b> ← 当前</b>" if zh else "<b> &larr; today</b>") if here else ""
+        bars.append(
+            f"<tr{' class=here' if here else ''}><td class='n'>{_esc(label)}{mark}</td>"
+            f"<td class='bar'><span style='width:{share / widest * 100:.0f}%;"
+            f"background:{tone}'></span></td>"
+            f"<td class='v'>{share:.0%}</td>"
+            f"<td class='d'>n={int(block['sessions']):,}</td></tr>"
+        )
+    heading = "20 个交易日内回撤 5% 的历史频率" if zh else "How often a 5% drawdown followed within 20 sessions"
+    caption = (
+        "已结算历史上的发生频率,不是预测概率"
+        if zh
+        else "frequency over settled history, not a predicted probability"
+    )
+    return (
+        f"<h2>{_esc(heading)}</h2>"
+        f"<p class='hint'>{_esc(caption)}</p>"
+        "<table class='strip'><tbody>" + "".join(bars) + "</tbody></table>"
+    )
+
+
 def _rank_strip(report: dict[str, Any], language: str = "en") -> str:
     """One bar per indicator, ordered by how risky its level is.
 
@@ -902,6 +1017,7 @@ def render_html(
         rows.clear()
 
     strip = _rank_strip(report, language)
+    frequency = _frequency_chart(report, language)
     for line in markdown.splitlines():
         if line.startswith("|"):
             rows.append(line)
@@ -911,6 +1027,7 @@ def render_html(
             # Above the prose, because the question a reader arrives with is
             # "is anything unusual today" and every paragraph delays the answer.
             body.append(f"<h1>{_esc(line[2:])}</h1>")
+            body.append(frequency)
             body.append(strip)
         elif line.startswith("## "):
             body.append(f"<h2>{_esc(line[3:])}</h2>")
@@ -934,7 +1051,8 @@ def render_html(
         "td.bar span{display:block;height:.85rem;border-radius:2px;min-width:2px}"
         "td.v{text-align:right;font-variant-numeric:tabular-nums}"
         "td.n{color:#333}td.d{color:#777;font-size:.85em}"
-        "p.hint{color:#888;font-size:.85em;margin:.2rem 0 .6rem}</style>"
+        "p.hint{color:#888;font-size:.85em;margin:.2rem 0 .6rem}"
+        "tr.here td{font-weight:600}tr.here td.n{color:#111}</style>"
         + "".join(body)
     )
 

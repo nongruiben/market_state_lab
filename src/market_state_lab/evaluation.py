@@ -432,7 +432,26 @@ def current_target_exposures(
     if exposures.empty:
         return {}
     last = exposures.dropna(how="all").iloc[-1]
+    # The level each rule turns at. An exposure without its trigger says what to
+    # hold and not when that changes, which is the half a reader has to act on.
+    average = prices.rolling(settings.trend_window).mean()
+    realised = (
+        prices.pct_change().rolling(settings.volatility_window).std() * np.sqrt(TRADING_DAYS)
+    )
+    trend_trigger = float(average.iloc[-1]) if np.isfinite(average.iloc[-1]) else None
+    spot = float(prices.iloc[-1])
     return {
+        "spot": spot,
+        "trend_trigger_price": trend_trigger,
+        "trend_distance_pct": (
+            None if trend_trigger in (None, 0) else spot / trend_trigger - 1.0
+        ),
+        # The volatility target holds the cap until realised volatility exceeds
+        # the target itself; above that it scales down one for one.
+        "volatility_now_annual": (
+            float(realised.iloc[-1]) if np.isfinite(realised.iloc[-1]) else None
+        ),
+        "volatility_reduce_above": settings.volatility_target_annual,
         "trailing_exposure": float(last[VOLATILITY_TARGET]) if np.isfinite(last[VOLATILITY_TARGET]) else None,
         "ewma_exposure": float(last[EWMA_TARGET]) if np.isfinite(last[EWMA_TARGET]) else None,
         "trend_exposure": float(last[TREND_RULE]) if np.isfinite(last[TREND_RULE]) else None,

@@ -49,6 +49,11 @@ def _inputs(**over) -> ReportInputs:
             "trailing_exposure": 0.62,
             "ewma_exposure": 0.55,
             "trend_exposure": 1.0,
+            "spot": 765.96,
+            "trend_trigger_price": 710.43,
+            "trend_distance_pct": 0.0782,
+            "volatility_now_annual": 0.083,
+            "volatility_reduce_above": 0.10,
             "target_volatility_annual": 0.10,
             "measured_history": "26-year ledger",
             "note": "a yardstick, not advice",
@@ -93,14 +98,20 @@ def test_the_english_report_is_unchanged_in_structure() -> None:
 
 
 def test_the_reference_exposure_line_is_present_in_both_languages() -> None:
+    """It moved to the page headline; the guarantee is that it is in both, once.
+
+    Stating it twice left two copies of one number that could drift apart, and
+    the buried copy was the reason the useful line was hard to find.
+    """
     report = build_report(_inputs())
-    english = render_markdown(report)
-    chinese = render_markdown(report, "zh")
-    assert "reference exposure (volatility targeting at 10%" in english
-    assert "62%" in english and "55%" in english
-    assert "参考暴露(波动率目标化 10%" in chinese
-    assert "26 年账本" in chinese
-    assert "最差情景是 2000-2002 慢熊" in chinese
+    english = render_markdown(report).split("## 1.")[0]
+    chinese = render_markdown(report, "zh").split("## 1.")[0]
+    assert "Volatility target 62%" in english and "EWMA variant 55%" in english
+    assert "波动率目标 62%" in chinese and "EWMA 变体 55%" in chinese
+    assert "yardstick, not advice" in english
+    assert "标尺不是建议" in chinese
+    # Once, not twice.
+    assert render_markdown(report).count("Volatility target 62%") == 1
 
 
 def test_the_conditional_frequencies_block_renders_in_both_languages() -> None:
@@ -267,3 +278,46 @@ def test_an_overlapping_indicator_gets_no_bar() -> None:
     html = render_html(build_report(_inputs()))
     assert "hyg_over_lqd" not in re.sub(r"<table(?! class='strip').*?</table>", "", html,
                                         flags=re.S).split("</table>")[0]
+
+
+def test_the_frequency_chart_marks_the_condition_that_holds_today() -> None:
+    """"Which of these am I in" is the question a reader brings; the chart
+    should not make them work it out."""
+    from market_state_lab.evaluation import conditional_frequencies
+    from market_state_lab.main_report import render_html
+
+    spy = _prices()["spy"]
+    html = render_html(build_report(_inputs(conditionals=conditional_frequencies(spy))))
+    assert "How often a 5% drawdown followed" in html
+    # The marker is an entity, not the literal text of one.
+    assert "&amp;larr;" not in html
+    assert "class=here" in html
+
+
+def test_the_headline_states_both_rules_and_the_level_each_turns_at() -> None:
+    # An exposure without its trigger says what to hold and not when that
+    # changes, which is the half a reader has to act on.
+    markdown = render_markdown(build_report(_inputs()))
+    head = markdown.split("## 1.")[0]
+    assert "Trend rule" in head and "Volatility target" in head
+    assert "200-session average" in head
+    assert "scales down one for one" in head
+    assert "Neither is a forecast" in head
+
+
+def test_an_exposure_without_its_trigger_is_still_stated() -> None:
+    # The exposure is useful on its own; suppressing it for want of the trigger
+    # would lose the more important half.
+    bare = {"trend_exposure": 0.0, "trailing_exposure": 0.45}
+    markdown = render_markdown(build_report(_inputs(reference_exposure=bare)))
+    head = markdown.split("## 1.")[0]
+    # 0% is the rule saying hold nothing - the most consequential thing it says,
+    # and exactly what a truthiness check would delete.
+    assert "Trend rule 0%" in head
+    assert "Volatility target 45%" in head
+
+
+def test_no_exposure_at_all_renders_no_heading() -> None:
+    markdown = render_markdown(build_report(_inputs(reference_exposure={})))
+    # A heading and a caveat with nothing between them is worse than silence.
+    assert "Reference exposure" not in markdown.split("## 1.")[0]
