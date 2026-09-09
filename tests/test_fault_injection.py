@@ -17,6 +17,12 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from market_state_lab.data.reconciliation import (
+    SourceSeries,
+    agreement_cannot_clear,
+    confirm_move,
+    reconcile_closes,
+)
 from market_state_lab.data.snapshots import default_eligibility
 from market_state_lab.data.validation import (
     DAY_END,
@@ -314,17 +320,57 @@ def test_the_filter_that_catches_the_fault_does_not_catch_a_crash() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Rows 2 and 9: a second source confirms an event, and never clears a
+# quarantine.
+# ---------------------------------------------------------------------------
+
+
+def test_a_crash_both_sources_saw_is_an_event_that_may_not_be_filtered() -> None:
+    closes = [770.0] * 5 + [508.0]
+    primary = SourceSeries("TWS", pd.Series(closes, index=pd.date_range("2026-09-01", periods=6)))
+    secondary = SourceSeries(
+        "Yahoo", pd.Series([c * 1.00001 for c in closes],
+                           index=pd.date_range("2026-09-01", periods=6))
+    )
+    result = reconcile_closes("SPY", primary, secondary)
+    verdict = confirm_move(result, primary.values.index[-1], primary, secondary)
+    assert verdict.code == "move_confirmed"
+    assert "may not filter it away" in verdict.detail or "filter it away" in verdict.detail
+
+
+def test_two_feeds_agreeing_on_a_corrupt_bar_still_leaves_it_quarantined() -> None:
+    # The case where agreement means nothing: one bad file resold by two
+    # vendors agrees with itself perfectly.
+    closes = [770.0, 77000.0]
+    index = pd.date_range("2026-09-01", periods=2)
+    primary = SourceSeries("TWS", pd.Series(closes, index=index))
+    secondary = SourceSeries("Yahoo", pd.Series(closes, index=index))
+    result = reconcile_closes("SPY", primary, secondary)
+    assert result.agreed
+    single = validate_daily_bars(pd.DataFrame({"close": primary.values}), "SPY")
+    after = agreement_cannot_clear(result, single)
+    assert [i for i in after if i.severity == "quarantine"]
+    assert any(i.code == "agreement_does_not_clear_quarantine" for i in after)
+
+
+def test_a_raw_series_may_not_be_compared_against_an_adjusted_one() -> None:
+    # A year of SPY dividends is 1.1% of drift, and a measured tolerance
+    # absorbs it and reports agreement. The convention is the check.
+    index = pd.date_range("2026-09-01", periods=3)
+    raw = SourceSeries("TWS", pd.Series([770.0, 771.0, 769.0], index=index), adjusted=False)
+    adjusted = SourceSeries("Yahoo", pd.Series([762.0, 763.0, 761.0], index=index), adjusted=True)
+    result = reconcile_closes("SPY", raw, adjusted)
+    assert any(i.code == "convention_mismatch" for i in result.issues)
+    assert result.comparison.empty
+
+
+# ---------------------------------------------------------------------------
 # Unbuilt rows. They stay listed until their layer lands:
 #
-# 2  real crash confirmed by a    -> data/reconciliation.py (6.4): the second
-#    second source                    source is what confirms it. The half that
-#                                     does not need a second source - a crash is
-#                                     reviewed and never deleted - is covered
-#                                     above; confirmation is not.
-# 3  split/dividend口径 mismatch  -> data/validation.py (6.3): corporate actions
-#                                   recorded with effective_at and known_at.
-# 9  multi-source common anomaly -> data/reconciliation.py (6.4): a common
-#                                   anomaly is not passed by majority vote.
+# 3  split/dividend口径 mismatch  -> data/validation.py (6.3): the convention
+#                                   check catches a raw-against-adjusted
+#                                   comparison, but corporate actions are not
+#                                   yet stored with effective_at and known_at.
 # 11 historical pollution repair -> features/models: dependent features and
 #                                   state invalidated and replayed; original
 #                                   report kept.

@@ -43,6 +43,11 @@ class PublicDataBundle:
     etf_close: pd.DataFrame = field(default_factory=pd.DataFrame)
     manifest: pd.DataFrame = field(default_factory=pd.DataFrame)
     point_in_time_status: str = "latest_vintage"
+    # Appended, not inserted: the bundle is built positionally, and putting a
+    # field in the middle silently shifts every argument after it. Both price
+    # conventions are kept and never merged - the adjusted series for return
+    # studies, the raw one for comparison against an unadjusted feed.
+    etf_close_unadjusted: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 class PublicDataLoader:
@@ -386,6 +391,10 @@ class PublicDataLoader:
         return pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
 
     def _yahoo(self, symbols: dict[str, str]) -> pd.DataFrame:
+        # Populated alongside the adjusted series and exposed as
+        # `etf_close_unadjusted`, so a cross-source check has something it is
+        # allowed to compare.
+        raw_frames: list[pd.Series] = []
         section = self.config["data"]["yahoo"]
         frames: list[pd.Series] = []
         last_request = 0.0
@@ -431,6 +440,18 @@ class PublicDataLoader:
                 values = adjusted_values if len(adjusted_values) == len(timestamps) else close_values
                 if not timestamps or len(values) != len(timestamps):
                     raise ValueError("Yahoo chart timestamps and closes are inconsistent")
+                # 6.3 keeps the conventions apart. The adjusted series is what a
+                # return study needs; only the raw one can be compared against an
+                # unadjusted feed, and a year of SPY dividends is a 1.1% drift
+                # between them - wide enough to swallow a real disagreement.
+                if len(close_values) == len(timestamps):
+                    raw_frames.append(
+                        pd.Series(
+                            pd.to_numeric(close_values, errors="coerce"),
+                            index=pd.to_datetime(timestamps, unit="s", utc=True).tz_localize(None),
+                            name=name,
+                        )
+                    )
                 series = pd.Series(
                     pd.to_numeric(values, errors="coerce"),
                     index=pd.to_datetime(timestamps, unit="s", utc=True).tz_localize(None),
@@ -445,6 +466,8 @@ class PublicDataLoader:
                 if "429" in str(exc):
                     time.sleep(float(section.get("cooldown_seconds", 120)))
                 self._record(name, "Yahoo Finance Chart", None, "failed", str(exc))
+        if raw_frames:
+            self.unadjusted_close = pd.concat(raw_frames, axis=1).sort_index()
         return pd.concat(frames, axis=1).sort_index() if frames else pd.DataFrame()
 
     def load(self) -> PublicDataBundle:
@@ -480,5 +503,6 @@ class PublicDataLoader:
         else:
             point_in_time_status = "latest_vintage_macro_and_french"
         return PublicDataBundle(
-            macro, vix, ofr, french, etf_close, manifest, point_in_time_status
+            macro, vix, ofr, french, etf_close, manifest, point_in_time_status,
+            etf_close_unadjusted=getattr(self, "unadjusted_close", pd.DataFrame()),
         )
