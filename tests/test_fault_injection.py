@@ -1,11 +1,16 @@
 """The fault-injection matrix, plan section 16.1, against the layers that exist.
 
-Each row injects a fault into recorded data and pins the behaviour the plan
-demands. Rows whose guarding layer is not built yet are listed at the bottom
-with the module that owns them - they are the remaining scope of this phase,
-and this file is the checklist that says so. A row listed as unbuilt must not
-be claimed as covered; that is exactly the over-claiming this phase exists to
-stop.
+Twelve scenarios, ten of them covered here. Each injects a fault into recorded
+data and pins the behaviour the plan demands. The two whose guarding layer is
+not built yet are listed at the bottom with the module that owns them - they
+are the remaining scope, and this file is the checklist that says so. A row
+listed as unbuilt must not be claimed as covered; that is exactly the
+over-claiming this phase exists to stop.
+
+Both remaining rows need a layer that does not exist rather than work that was
+skipped: replaying dependent features after a historical revision needs the
+feature layer, and a low-frequency alert state machine needs the assessment
+layer. This matrix is therefore as complete as it can be until P3 lands.
 
 The injection target is what the previous layer now produces: raw payloads with
 a request record each, from which the pipeline is rebuilt. Live connections are
